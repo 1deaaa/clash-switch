@@ -1,0 +1,26 @@
+# Python Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+tests/
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Pytest & testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+monitor.log
+
+# User Configuration
+config.json
+
+# OS-specific
+.DS_Store
+Thumbs.db
