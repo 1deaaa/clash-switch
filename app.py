@@ -4,14 +4,13 @@ import json
 import copy
 import os
 import pathlib
-import signal
 import subprocess
 import sys
 import threading
 import tkinter as tk
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tkinter import messagebox
+from tkinter import font as tkfont, messagebox
 
 import customtkinter as ctk
 
@@ -19,14 +18,22 @@ from mihomo_client import ControllerSettings, MihomoClient
 from monitor_service import (
     CONFIG_PATH,
     LOG_PATH,
-    PID_PATH,
     MonitorConfig,
     probe_node_delays,
     probe_selected_web,
 )
+from service_manager import MonitorServiceManager, ServiceManagerError
 
 
 ROOT = pathlib.Path(__file__).resolve().parent
+
+
+def configure_linux_font(root: tk.Misc) -> None:
+    """让 Linux 控件继承桌面环境的默认字体。"""
+    if not sys.platform.startswith("linux"):
+        return
+    default_font = tkfont.nametofont("TkDefaultFont", root=root)
+    ctk.ThemeManager.theme["CTkFont"]["family"] = default_font.cget("family")
 
 
 def normalize_allowed_hosts(test_urls: list[str], raw_hosts: str) -> list[str]:
@@ -104,13 +111,23 @@ class ConfigApp(ctk.CTk):
         self.minsize(780, 720)
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
+        configure_linux_font(self)
         self.config_data = MonitorConfig.load()
         self.candidate_vars: dict[str, tk.BooleanVar] = {}
         self.node_status_labels = {}
         self.node_test_results = {}
         self.selected_candidates = set(self.config_data.candidates)
         self.provider_filter = "全部订阅"
+        self._selection_anchor: str | None = None
+        self._shift_pressed = False
+        self._visible_candidate_names: list[str] = []
         self.process: subprocess.Popen[str] | None = None
+        self.service_manager = MonitorServiceManager(ROOT)
+        self._current_node_refreshing = False
+        self.bind_all("<KeyPress-Shift_L>", self._mark_shift_pressed, add="+")
+        self.bind_all("<KeyPress-Shift_R>", self._mark_shift_pressed, add="+")
+        self.bind_all("<KeyRelease-Shift_L>", self._mark_shift_released, add="+")
+        self.bind_all("<KeyRelease-Shift_R>", self._mark_shift_released, add="+")
         self._build()
         self.after(200, self.refresh_groups)
         self.after(1000, self.refresh_status)
@@ -158,7 +175,7 @@ class ConfigApp(ctk.CTk):
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.grid(row=2, column=0, padx=24, pady=14, sticky="nsew")
         content.grid_columnconfigure(0, weight=1)
-        content.grid_rowconfigure(2, weight=1)
+        content.grid_rowconfigure(3, weight=1)
         controls = ctk.CTkFrame(content, fg_color="transparent")
         controls.grid(row=0, column=0, sticky="ew")
         controls.grid_columnconfigure(1, weight=1)
@@ -173,10 +190,15 @@ class ConfigApp(ctk.CTk):
         self.select_all_button = ctk.CTkButton(controls, text="全选/反选", width=80, command=self.toggle_all)
         self.select_all_button.grid(row=1, column=2, padx=(8, 0), pady=(10, 0))
 
-        ctk.CTkLabel(content, text="候选节点（仅从当前运行配置抽取）").grid(row=1, column=0, pady=(12, 6), sticky="w")
+        self.current_node_label = ctk.CTkLabel(content, text="当前使用节点：正在读取…", anchor="w")
+        self.current_node_label.grid(row=1, column=0, pady=(12, 4), sticky="w")
+        ctk.CTkLabel(content, text="候选节点（仅从当前运行配置抽取）").grid(row=2, column=0, pady=(6, 6), sticky="w")
         self.nodes_frame = ctk.CTkScrollableFrame(content, corner_radius=6)
-        self.nodes_frame.grid(row=2, column=0, sticky="nsew")
+        self.nodes_frame.grid(row=3, column=0, sticky="nsew")
         self.nodes_frame.grid_columnconfigure(0, weight=1)
+        if sys.platform.startswith("linux"):
+            self.bind_all("<Button-4>", lambda event: self._scroll_candidates(event, -3), add="+")
+            self.bind_all("<Button-5>", lambda event: self._scroll_candidates(event, 3), add="+")
 
         footer = ctk.CTkFrame(self, corner_radius=6)
         footer.grid(row=3, column=0, padx=24, pady=(0, 20), sticky="ew")
@@ -185,7 +207,13 @@ class ConfigApp(ctk.CTk):
         self.save_button.grid(row=0, column=0, padx=10, pady=10)
         self.test_button = ctk.CTkButton(footer, text="立即测试", command=self.test_once)
         self.test_button.grid(row=0, column=1, padx=0, pady=10)
-        self.service_button = ctk.CTkButton(footer, text="启动服务", command=self.toggle_service)
+        self.service_button = ctk.CTkButton(
+            footer,
+            text="启动服务",
+            fg_color="#16a34a",
+            hover_color="#15803d",
+            command=self.toggle_service,
+        )
         self.service_button.grid(row=0, column=2, padx=10, pady=10)
         self.status_label = ctk.CTkLabel(footer, text="服务未运行")
         self.status_label.grid(row=0, column=3, padx=10, pady=10, sticky="e")
@@ -203,14 +231,17 @@ class ConfigApp(ctk.CTk):
         ):
             widget.configure(state=state)
 
-    def _background(self, func, success=None) -> None:
+    def _background(self, func, success=None, failure=None) -> None:
         def worker() -> None:
             try:
                 result = func()
                 if success:
                     self.after(0, lambda: success(result))
             except Exception as exc:
-                self.after(0, lambda: messagebox.showerror("操作失败", str(exc)))
+                if failure:
+                    self.after(0, lambda: failure(exc))
+                else:
+                    self.after(0, lambda: messagebox.showerror("操作失败", str(exc)))
         threading.Thread(target=worker, daemon=True).start()
 
     def refresh_groups(self) -> None:
@@ -220,6 +251,8 @@ class ConfigApp(ctk.CTk):
             self.group_menu.configure(values=names)
             selected = self.config_data.group if self.config_data.group in groups else names[0]
             self.group_menu.set(selected)
+            current = str(groups.get(selected, {}).get("now") or "未选择")
+            self.current_node_label.configure(text=f"当前使用节点：{current}")
             self.refresh_button.configure(state="normal")
             self.refresh_candidates()
         self._background(self._client().selector_groups, done)
@@ -227,7 +260,21 @@ class ConfigApp(ctk.CTk):
     def refresh_candidates(self) -> None:
         group = self.group_menu.get()
         self.node_test_results = {}
-        def done(items: list[dict[str, str]]) -> None:
+        self._selection_anchor = None
+        if group == "没有 Selector 策略组":
+            self.current_node_label.configure(text="当前使用节点：没有可用策略组")
+            self._all_candidates = []
+            self.provider_filter = "全部订阅"
+            self.provider_menu.configure(values=[self.provider_filter])
+            self.provider_menu.set(self.provider_filter)
+            self._render_candidates()
+            return
+        self.current_node_label.configure(text="当前使用节点：正在读取…")
+        def done(snapshot: tuple[str, list[dict[str, str]]]) -> None:
+            current, items = snapshot
+            if group != self.group_menu.get():
+                return
+            self.current_node_label.configure(text=f"当前使用节点：{current or '未选择'}")
             self._all_candidates = items
             providers = ["全部订阅"] + sorted({item["provider"] for item in items})
             self.provider_menu.configure(values=providers)
@@ -235,7 +282,7 @@ class ConfigApp(ctk.CTk):
                 self.provider_filter = "全部订阅"
                 self.provider_menu.set(self.provider_filter)
             self._render_candidates()
-        self._background(lambda: self._client().candidates(group), done)
+        self._background(lambda: self._client().selector_group_candidates(group), done)
 
     def _filter_provider(self, value: str) -> None:
         self._capture_visible_selection()
@@ -249,15 +296,45 @@ class ConfigApp(ctk.CTk):
             else:
                 self.selected_candidates.discard(name)
 
+    def _mark_shift_pressed(self, _event: tk.Event) -> None:
+        self._shift_pressed = True
+
+    def _mark_shift_released(self, _event: tk.Event) -> None:
+        self._shift_pressed = False
+
+    def _toggle_candidate(self, name: str, var: tk.BooleanVar) -> None:
+        if self._shift_pressed and self._selection_anchor in self.candidate_vars:
+            start = self._visible_candidate_names.index(self._selection_anchor)
+            end = self._visible_candidate_names.index(name)
+            for candidate_name in self._visible_candidate_names[min(start, end):max(start, end) + 1]:
+                self.candidate_vars[candidate_name].set(var.get())
+        else:
+            self._selection_anchor = name
+        self._capture_visible_selection()
+
+    def _scroll_candidates(self, event: tk.Event, units: int) -> str | None:
+        if self.nodes_frame.check_if_master_is_canvas(event.widget):
+            self.nodes_frame._parent_canvas.yview_scroll(units, "units")
+            return "break"
+        return None
+
     def _render_candidates(self) -> None:
         for child in self.nodes_frame.winfo_children():
             child.destroy()
         self.candidate_vars = {}
         shown = [item for item in getattr(self, "_all_candidates", []) if self.provider_filter == "全部订阅" or item["provider"] == self.provider_filter]
+        self._visible_candidate_names = [item["name"] for item in shown]
+        if self._selection_anchor not in self._visible_candidate_names:
+            self._selection_anchor = None
         for row, item in enumerate(shown):
             var = tk.BooleanVar(value=item["name"] in self.selected_candidates)
             self.candidate_vars[item["name"]] = var
-            box = ctk.CTkCheckBox(self.nodes_frame, text=item["name"], variable=var)
+            box = ctk.CTkCheckBox(
+                self.nodes_frame,
+                text=item["name"],
+                variable=var,
+                command=lambda name=item["name"], candidate_var=var: self._toggle_candidate(name, candidate_var),
+            )
             box.grid(row=row, column=0, padx=10, pady=5, sticky="w")
             result = self.node_test_results.get(item["name"])
             status_text = ""
@@ -279,6 +356,7 @@ class ConfigApp(ctk.CTk):
         target = not all(var.get() for var in self.candidate_vars.values())
         for var in self.candidate_vars.values():
             var.set(target)
+        self._selection_anchor = None
         self._capture_visible_selection()
 
     def _collect_config(self, require_candidates: bool = True) -> MonitorConfig:
@@ -317,7 +395,7 @@ class ConfigApp(ctk.CTk):
         self.config_data = self._collect_config(require_candidates=True)
         self.config_data.save()
         if notify:
-            messagebox.showinfo("已保存", f"已保存 {len(selected)} 个候选节点")
+            messagebox.showinfo("已保存", f"已保存 {len(self.config_data.candidates)} 个候选节点")
         return self.config_data
 
     def test_once(self) -> None:
@@ -368,17 +446,7 @@ class ConfigApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _is_running(self) -> bool:
-        if self.process and self.process.poll() is None:
-            return True
-        if not PID_PATH.exists():
-            return False
-        try:
-            pid = int(PID_PATH.read_text(encoding="ascii"))
-            os.kill(pid, 0)
-            return True
-        except (ValueError, OSError):
-            PID_PATH.unlink(missing_ok=True)
-            return False
+        return self.service_manager.is_running()
 
     def toggle_service(self) -> None:
         if self._is_running():
@@ -389,32 +457,53 @@ class ConfigApp(ctk.CTk):
         except Exception as exc:
             messagebox.showerror("配置错误", str(exc))
             return
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        self.process = subprocess.Popen([sys.executable, str(ROOT / "monitor_service.py")], cwd=ROOT, creationflags=flags)
+        try:
+            self.process = self.service_manager.start()
+        except ServiceManagerError as exc:
+            messagebox.showerror("启动服务失败", str(exc))
+            return
         self.after(500, self.refresh_status)
 
     def stop_service(self) -> None:
         try:
-            pid = int(PID_PATH.read_text(encoding="ascii"))
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True, check=False)
-            else:
-                os.kill(pid, signal.SIGTERM)
-        except (FileNotFoundError, ValueError, ProcessLookupError):
-            pass
-        PID_PATH.unlink(missing_ok=True)
+            self.service_manager.stop()
+        except ServiceManagerError as exc:
+            messagebox.showerror("停止服务失败", str(exc))
+            return
         self.process = None
         self.refresh_status()
 
+    def _refresh_current_node(self) -> None:
+        group = self.group_menu.get()
+        if self._current_node_refreshing or group in {"", "正在读取…", "没有 Selector 策略组"}:
+            return
+        self._current_node_refreshing = True
+
+        def done(current: str) -> None:
+            if group == self.group_menu.get():
+                self.current_node_label.configure(text=f"当前使用节点：{current or '未选择'}")
+            self._current_node_refreshing = False
+
+        def failed(_exc: Exception) -> None:
+            if group == self.group_menu.get():
+                self.current_node_label.configure(text="当前使用节点：无法读取")
+            self._current_node_refreshing = False
+
+        self._background(lambda: self._client().current_selector(group), done, failed)
+
     def refresh_status(self) -> None:
         running = self._is_running()
-        self.service_button.configure(text="停止服务" if running else "启动服务")
+        if running:
+            self.service_button.configure(text="停止服务", fg_color="#dc2626", hover_color="#b91c1c")
+        else:
+            self.service_button.configure(text="启动服务", fg_color="#16a34a", hover_color="#15803d")
         self.status_label.configure(text="服务运行中" if running else "服务未运行")
+        self._refresh_current_node()
         if LOG_PATH.exists():
             lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-6:]
             self.log_box.delete("1.0", "end")
             self.log_box.insert("end", "\n".join(lines))
-        self.after(1500, self.refresh_status)
+        self.after(3000, self.refresh_status)
 
 
 def main() -> None:

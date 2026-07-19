@@ -235,6 +235,16 @@ GUI 的“高级网页重定向判定”关闭后，程序只执行 Mihomo 延�
 
 ## 7. Linux 后台运行
 
+### 7.1 桌面 GUI 自动启动
+
+完成配置后点击 GUI 的“启动服务”，程序会创建 `$XDG_CONFIG_HOME/systemd/user/clash-verge-node-guard.service`（未设置 `XDG_CONFIG_HOME` 时为 `~/.config/systemd/user/`），并执行等价的用户级启用与启动操作。服务使用启动 GUI 的 Python 解释器和项目绝对路径，因此会继承项目虚拟环境。
+
+该服务会在用户登录后自动启动，能够访问 Clash Verge Rev 同一桌面会话创建的 Unix Socket。GUI 的服务状态取自 `systemctl --user is-active`，不依赖 PID 文件是否残留。GUI 中的“停止服务”只停止当前服务，自动启动仍保持启用状态。
+
+用户级服务不能在没有登录该用户时可靠地访问桌面会话的 Mihomo Socket；不建议为这个场景启用 linger。需要在无桌面环境下运行时，使用下面的系统级服务方式，并改为稳定的外部控制器或确保 Socket 权限正确。
+
+### 7.2 前台与系统级服务
+
 前台运行：
 
 ```bash

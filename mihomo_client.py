@@ -157,6 +157,27 @@ class MihomoClient:
     def selector_groups(self) -> dict[str, dict[str, Any]]:
         return {name: item for name, item in self.proxies().items() if item.get("type") == "Selector"}
 
+    def current_selector(self, group: str) -> str:
+        group_data = self.selector_groups().get(group)
+        if group_data is None:
+            raise MihomoError(f"找不到 Selector 策略组：{group}")
+        return str(group_data.get("now") or "")
+
+    def selector_group_candidates(self, group: str) -> tuple[str, list[dict[str, str]]]:
+        """读取策略组当前节点及其可选的真实节点。"""
+        proxies = self.proxies()
+        group_data = proxies.get(group, {})
+        if group_data.get("type") != "Selector":
+            raise MihomoError(f"找不到 Selector 策略组：{group}")
+
+        candidates = []
+        for name in group_data.get("all", []):
+            item = proxies.get(name, {})
+            if item.get("type") in {"Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject"}:
+                continue
+            candidates.append({"name": name, "provider": str(item.get("provider-name") or "本地配置")})
+        return str(group_data.get("now") or ""), candidates
+
     def test_delay(self, proxy: str, url: str, timeout_ms: int) -> int:
         query = urllib.parse.urlencode({"url": url, "timeout": timeout_ms})
         path = f"/proxies/{urllib.parse.quote(proxy, safe='')}/delay?{query}"
@@ -225,12 +246,4 @@ class MihomoClient:
         return {"status": status, "final_url": final_url, "elapsed_ms": elapsed_ms}
 
     def candidates(self, group: str) -> list[dict[str, str]]:
-        proxies = self.proxies()
-        group_data = proxies.get(group, {})
-        result = []
-        for name in group_data.get("all", []):
-            item = proxies.get(name, {})
-            if item.get("type") in {"Selector", "URLTest", "Fallback", "LoadBalance", "Direct", "Reject"}:
-                continue
-            result.append({"name": name, "provider": str(item.get("provider-name") or "本地配置")})
-        return result
+        return self.selector_group_candidates(group)[1]

@@ -40,6 +40,8 @@ Clash Verge Rev 通常通过 `/tmp/verge/verge-mihomo.sock` 提供控制接口�
 .venv/bin/python monitor_service.py
 ```
 
+在 Linux 桌面环境中，完成配置后点击 GUI 的“启动服务”会自动创建并启用用户级 systemd 服务。此后服务会在该用户登录时自动启动，GUI 通过 systemd 查询实际运行状态；点击“停止服务”只停止当前进程，下次登录仍会自动启动。
+
 若 Unix Socket 路径不同，在 `config.json` 的 `controller_socket` 填入实际路径。也可将 `controller_url` 设为仅监听本机的外部控制地址，例如 `http://127.0.0.1:9097`。
 
 ## 切换规则
