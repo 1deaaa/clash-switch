@@ -1,6 +1,6 @@
 # Clash Verge 节点守护
 
-跨 Windows 与 Linux 的 Mihomo/Clash Verge Rev 节点连通性监控器。默认每 60 秒测试 AI Studio 与 Docker Hub；连续失败达到阈值后，仅测试你在 GUI 中勾选的候选节点，并切换到可用且延迟最低的节点。检测包含 Mihomo 延迟初筛，以及检查最终网页落点和地区拦截特征的无 Cookie 复检。
+跨 Windows 与 Linux 的 Mihomo/Clash Verge Rev 节点连通性监控器。默认每 60 秒测试 AI Studio、Docker Hub 与 GitHub；连续失败达到阈值后，仅测试你在 GUI 中勾选的候选节点，并切换到可用且延迟最低的节点。检测包含 Mihomo 延迟初筛，以及检查最终网页落点和地区拦截特征的无 Cookie 复检。
 
 ## Windows
 
@@ -8,7 +8,7 @@
 2. 双击 `clash-auto-switch.pyw`。如果系统没有关联 `.pyw`，则双击 `run_gui.bat`。
 3. 选择策略组和候选节点，保存后点击“启动服务”。
 
-测试网址支持多个值，以英文逗号分隔。所有网址都通过才认为节点可用，显示延迟取其中最大值。默认配置包含 `https://aistudio.google.com` 和 `https://hub.docker.com/`。
+测试网址支持多个值，以英文逗号分隔。所有网址都通过才认为节点可用，显示延迟取其中最大值。默认配置包含 `https://aistudio.google.com`、`https://hub.docker.com/` 和 `https://github.com/`。
 
 “高级网页重定向判定”默认开启。可填写允许的最终域名及需要拦截的 URL 关键词；关闭后退回仅延迟探测。保存时会自动允许每个测试网址自身的域名。
 

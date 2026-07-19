@@ -20,14 +20,14 @@ LOG_PATH = ROOT / "monitor.log"
 @dataclass(slots=True)
 class MonitorConfig:
     test_urls: list[str] = field(
-        default_factory=lambda: ["https://aistudio.google.com", "https://hub.docker.com/"]
+        default_factory=lambda: ["https://aistudio.google.com", "https://hub.docker.com/", "https://github.com/"]
     )
     interval_seconds: int = 60
     timeout_ms: int = 10000
     failure_threshold: int = 2
     advanced_web_probe: bool = True
     allowed_redirect_hosts: list[str] = field(
-        default_factory=lambda: ["aistudio.google.com", "accounts.google.com"]
+        default_factory=lambda: ["aistudio.google.com", "accounts.google.com", "github.com"]
     )
     blocked_url_keywords: list[str] = field(
         default_factory=lambda: ["available-regions"]

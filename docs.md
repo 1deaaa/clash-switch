@@ -159,13 +159,14 @@ GET /providers/proxies/{提供者名称}
 {
   "test_urls": [
     "https://aistudio.google.com",
-    "https://hub.docker.com/"
+    "https://hub.docker.com/",
+    "https://github.com/"
   ],
   "interval_seconds": 60,
   "timeout_ms": 10000,
   "failure_threshold": 2,
   "advanced_web_probe": true,
-  "allowed_redirect_hosts": ["aistudio.google.com", "accounts.google.com"],
+  "allowed_redirect_hosts": ["aistudio.google.com", "accounts.google.com", "github.com"],
   "blocked_url_keywords": ["available-regions"],
   "group": "🚀节点选择",
   "candidates": ["节点甲", "节点乙"],

@@ -63,7 +63,7 @@ class MonitorServiceManager:
                 "",
                 "[Service]",
                 "Type=simple",
-                f"WorkingDirectory={_quote_systemd(str(self.root))}",
+                f"WorkingDirectory={self.root}",
                 f"ExecStart={_quote_systemd(self.interpreter)} {_quote_systemd(str(self.script_path))}",
                 "Restart=on-failure",
                 "RestartSec=5",
