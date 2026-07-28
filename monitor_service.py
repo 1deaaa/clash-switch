@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
+import math
 import pathlib
 import signal
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 
 from mihomo_client import ControllerSettings, MihomoClient, MihomoError
@@ -15,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 PID_PATH = ROOT / "monitor.pid"
 LOG_PATH = ROOT / "monitor.log"
+CACHE_MAX_AGE_SECONDS = 90.0
 
 
 @dataclass(slots=True)
@@ -23,8 +28,8 @@ class MonitorConfig:
         default_factory=lambda: ["https://aistudio.google.com", "https://hub.docker.com/", "https://github.com/"]
     )
     interval_seconds: int = 60
-    timeout_ms: int = 10000
-    failure_threshold: int = 2
+    timeout_ms: int = 5000
+    failure_threshold: int = 1
     advanced_web_probe: bool = True
     allowed_redirect_hosts: list[str] = field(
         default_factory=lambda: ["aistudio.google.com", "accounts.google.com", "github.com"]
@@ -50,10 +55,16 @@ class MonitorConfig:
 
 
 def configure_logging() -> None:
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=2,
+        encoding="utf-8",
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
+        handlers=[file_handler, logging.StreamHandler()],
         force=True,
     )
 
@@ -65,6 +76,9 @@ class Monitor:
         settings = ControllerSettings(url=config.controller_url, socket_path=config.controller_socket)
         self.client = MihomoClient(settings)
         self.failures = 0
+        self.failed_node = ""
+        self.round_id = 0
+        self.node_cache: dict[str, dict[str, object]] = {}
 
     def _current(self) -> str:
         group = self.client.selector_groups().get(self.config.group)
@@ -72,81 +86,189 @@ class Monitor:
             raise MihomoError(f"找不到策略组：{self.config.group}")
         return str(group.get("now") or "")
 
-    def _web_probe(self) -> dict[str, object] | None:
-        if not self.config.advanced_web_probe:
+    def _update_cache(self, name: str, result: dict[str, object], round_id: int) -> None:
+        cached = dict(result)
+        cached["checked_at"] = time.monotonic()
+        cached["round_id"] = round_id
+        self.node_cache[name] = cached
+
+    def _fresh_cached_candidates(self, current: str, round_id: int) -> list[tuple[int, str, dict[str, object]]]:
+        now = time.monotonic()
+        current_round = []
+        previous_round = []
+        for name in self.config.candidates:
+            cached = self.node_cache.get(name)
+            if name == current or not cached or cached.get("status") != "ok":
+                continue
+            if now - float(cached["checked_at"]) > CACHE_MAX_AGE_SECONDS:
+                continue
+            item = (int(cached["delay"]), name, cached)
+            if cached.get("round_id") == round_id:
+                current_round.append(item)
+            else:
+                previous_round.append(item)
+        return current_round or previous_round
+
+    def _switch_from_cache(self, current: str, round_id: int) -> dict[str, object] | None:
+        available = self._fresh_cached_candidates(current, round_id)
+        if not available:
             return None
-        pages = probe_selected_web(self.client, self.config)
-        return {"targets": pages}
+        delay, best, cached = min(available)
+        self.client.select(self.config.group, best)
+        self.failures = 0
+        self.failed_node = ""
+        source = "本轮" if cached.get("round_id") == round_id else "上一轮"
+        age = time.monotonic() - float(cached["checked_at"])
+        logging.info("已使用%s缓存切换：%s -> %s（%d ms，缓存 %.1f 秒）", source, current, best, delay, age)
+        return {"selected": best, "delay": delay, "cache_source": source, "cache_age_seconds": age}
 
     def check_once(self, allow_switch: bool = True) -> dict[str, object]:
         current = self._current()
-        try:
-            delay, delays = probe_node_delays(self.client, self.config, current)
-            page = self._web_probe()
-            self.failures = 0
-            if page:
-                landing = {url: item["final_url"] for url, item in page["targets"].items()}
-                logging.info("当前节点可用：%s，最大延迟 %d ms，网页落点 %s", current, delay, landing)
-            else:
-                logging.info("当前节点可用：%s，延迟 %d ms", current, delay)
-            return {"status": "ok", "current": current, "delay": delay, "delays": delays, "page": page}
-        except Exception as exc:
-            self.failures += 1
-            logging.warning("当前节点探测失败（%d/%d）：%s", self.failures, self.config.failure_threshold, exc)
-        if self.failures < self.config.failure_threshold or not allow_switch:
-            return {"status": "failed", "current": current, "switched": False}
+        nodes = list(dict.fromkeys([*self.config.candidates, current]))
+        self.round_id += 1
+        round_id = self.round_id
+        state: dict[str, object] = {"current_failed": False, "switched": None}
 
-        results: list[tuple[int, str]] = []
-        for candidate in self.config.candidates:
-            if candidate == current:
-                continue
-            try:
-                delay, _ = probe_node_delays(self.client, self.config, candidate)
-                page = None
-                if self.config.advanced_web_probe:
-                    self.client.select(self.config.group, candidate)
-                    page = self._web_probe()
-                results.append((delay, candidate))
-                if page:
-                    landing = {url: item["final_url"] for url, item in page["targets"].items()}
-                    logging.info("候选节点可用：%s，最大延迟 %d ms，网页落点 %s", candidate, delay, landing)
-                else:
-                    logging.info("候选节点可用：%s，延迟 %d ms", candidate, delay)
-            except Exception as exc:
-                logging.warning("候选节点不可用：%s（%s）", candidate, exc)
-        if not results:
-            self.client.select(self.config.group, current)
-            logging.error("没有可切换的可用候选节点，已恢复 %s", current)
-            return {"status": "no_candidate", "current": current, "switched": False}
-        delay, best = min(results)
-        self.client.select(self.config.group, best)
-        self.failures = 0
-        logging.info("已切换：%s -> %s（%d ms）", current, best, delay)
-        return {"status": "switched", "current": current, "selected": best, "delay": delay, "switched": True}
+        def handle_result(name: str, result: dict[str, object]) -> None:
+            self._update_cache(name, result, round_id)
+            _log_node_result(name, result)
+            if name == current:
+                if result["status"] == "ok":
+                    self.failures = 0
+                    self.failed_node = ""
+                    return
+                if self.failed_node != current:
+                    self.failures = 0
+                    self.failed_node = current
+                self.failures += 1
+                state["current_failed"] = True
+                logging.warning(
+                    "当前节点探测失败（%d/%d）：%s（%s）",
+                    self.failures,
+                    self.config.failure_threshold,
+                    current,
+                    result["error"],
+                )
+            if (
+                allow_switch
+                and state["current_failed"]
+                and state["switched"] is None
+                and self.failures >= self.config.failure_threshold
+            ):
+                state["switched"] = self._switch_from_cache(current, round_id)
+
+        results = probe_nodes_delays(self.client, self.config, nodes, handle_result)
+        current_result = results[current]
+        if current_result["status"] == "ok":
+            logging.info("本轮完成：当前节点 %s 可用，保持不变", current)
+            return {
+                "status": "ok",
+                "current": current,
+                "delay": current_result["delay"],
+                "delays": current_result["delays"],
+                "nodes": results,
+            }
+
+        switched = state["switched"]
+        if switched:
+            logging.info("本轮完成：当前节点 %s 失败，已切换到 %s", current, switched["selected"])
+            return {
+                "status": "switched",
+                "current": current,
+                "switched": True,
+                "nodes": results,
+                **switched,
+            }
+        if self.failures < self.config.failure_threshold or not allow_switch:
+            return {"status": "failed", "current": current, "switched": False, "nodes": results}
+        logging.error("缓存和本轮结果中都没有可切换的成功候选，保持 %s", current)
+        return {"status": "no_candidate", "current": current, "switched": False, "nodes": results}
 
     def run(self) -> None:
         PID_PATH.write_text(str(__import__("os").getpid()), encoding="ascii")
         logging.info("监控服务启动：组=%s，网址=%s，间隔=%d 秒", self.config.group, self.config.test_urls, self.config.interval_seconds)
         try:
             while not self.stop_event.is_set():
+                started = time.monotonic()
                 try:
                     self.check_once()
                 except Exception:
                     logging.exception("本轮监控发生错误")
-                self.stop_event.wait(max(5, self.config.interval_seconds))
+                elapsed = time.monotonic() - started
+                self.stop_event.wait(_seconds_until_next_round(elapsed, self.config.interval_seconds))
         finally:
             PID_PATH.unlink(missing_ok=True)
             logging.info("监控服务已停止")
 
 
-def probe_node_delays(client, config: MonitorConfig, node: str) -> tuple[int, dict[str, int]]:
-    """并发测试一个节点对全部目标网址的 Mihomo 延迟。"""
-    def probe(url: str) -> tuple[str, int]:
-        return url, client.test_delay(node, url, config.timeout_ms)
+def _delay_probe_target(url: str, strict: bool) -> tuple[str, str]:
+    """生成可由 Mihomo 独立节点探测的目标与期望状态码。"""
+    if not strict:
+        return url, ""
+    parsed = urllib.parse.urlparse(url)
+    if (parsed.hostname or "").lower() == "aistudio.google.com" and parsed.path in {"", "/"}:
+        parsed = parsed._replace(path="/welcome")
+        return urllib.parse.urlunparse(parsed), "200-299"
+    return url, "200-399"
 
-    with ThreadPoolExecutor(max_workers=max(1, min(8, len(config.test_urls)))) as pool:
-        delays = dict(pool.map(probe, config.test_urls))
-    return max(delays.values()), delays
+
+def _seconds_until_next_round(elapsed: float, interval_seconds: int) -> float:
+    """按轮次起点保持固定节拍，并跳过已经错过的时间点。"""
+    interval = max(5, interval_seconds)
+    periods = max(1, math.ceil(elapsed / interval))
+    return max(0.0, periods * interval - elapsed)
+
+
+def probe_nodes_delays(client, config: MonitorConfig, nodes, on_result=None) -> dict[str, dict[str, object]]:
+    """在同一线程池中并行测试全部节点与全部目标网址。"""
+    names = list(dict.fromkeys(str(node) for node in nodes))
+    results = {name: {"status": "ok", "delays": {}} for name in names}
+    tasks = []
+    for name in names:
+        for original_url in config.test_urls:
+            target_url, expected = _delay_probe_target(original_url, config.advanced_web_probe)
+            tasks.append((name, original_url, target_url, expected))
+
+    def probe(task):
+        name, original_url, target_url, expected = task
+        delay = client.test_delay(name, target_url, config.timeout_ms, expected)
+        return name, original_url, delay
+
+    remaining = {name: len(config.test_urls) for name in names}
+    with ThreadPoolExecutor(max_workers=max(1, min(256, len(tasks)))) as pool:
+        futures = {pool.submit(probe, task): task for task in tasks}
+        for future in as_completed(futures):
+            task = futures[future]
+            name, original_url, _, _ = task
+            try:
+                _, _, delay = future.result()
+                results[name]["delays"][original_url] = delay
+            except Exception as exc:
+                results[name]["status"] = "failed"
+                results[name].setdefault("error", str(exc))
+            remaining[name] -= 1
+            if remaining[name] == 0:
+                item = results[name]
+                if item["status"] == "ok":
+                    item["delay"] = max(item["delays"].values())
+                if on_result:
+                    on_result(name, item)
+    return results
+
+
+def probe_node_delays(client, config: MonitorConfig, node: str) -> tuple[int, dict[str, int]]:
+    """测试一个节点对全部目标网址的 Mihomo 延迟。"""
+    result = probe_nodes_delays(client, config, [node])[node]
+    if result["status"] != "ok":
+        raise MihomoError(str(result["error"]))
+    return int(result["delay"]), dict(result["delays"])
+
+
+def _log_node_result(name: str, result: dict[str, object]) -> None:
+    if result["status"] == "ok":
+        logging.info("节点可用：%s，最大延迟 %d ms，明细=%s", name, result["delay"], result["delays"])
+    else:
+        logging.warning("节点不可用：%s（%s）", name, result["error"])
 
 
 def probe_selected_web(client, config: MonitorConfig) -> dict[str, dict[str, object]]:

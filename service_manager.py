@@ -98,7 +98,7 @@ class MonitorServiceManager:
             return
         pid = int(self.pid_path.read_text(encoding="ascii"))
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True, check=False)
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
         else:
             os.kill(pid, signal.SIGTERM)
         self.pid_path.unlink(missing_ok=True)

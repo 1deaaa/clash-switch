@@ -178,8 +178,11 @@ class MihomoClient:
             candidates.append({"name": name, "provider": str(item.get("provider-name") or "本地配置")})
         return str(group_data.get("now") or ""), candidates
 
-    def test_delay(self, proxy: str, url: str, timeout_ms: int) -> int:
-        query = urllib.parse.urlencode({"url": url, "timeout": timeout_ms})
+    def test_delay(self, proxy: str, url: str, timeout_ms: int, expected: str = "") -> int:
+        params: dict[str, object] = {"url": url, "timeout": timeout_ms}
+        if expected:
+            params["expected"] = expected
+        query = urllib.parse.urlencode(params)
         path = f"/proxies/{urllib.parse.quote(proxy, safe='')}/delay?{query}"
         return int(self.request("GET", path)["delay"])
 

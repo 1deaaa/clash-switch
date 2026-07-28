@@ -9,7 +9,6 @@ import sys
 import threading
 import tkinter as tk
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import font as tkfont, messagebox
 
 import customtkinter as ctk
@@ -19,8 +18,7 @@ from monitor_service import (
     CONFIG_PATH,
     LOG_PATH,
     MonitorConfig,
-    probe_node_delays,
-    probe_selected_web,
+    probe_nodes_delays,
 )
 from service_manager import MonitorServiceManager, ServiceManagerError
 
@@ -49,58 +47,18 @@ def normalize_allowed_hosts(test_urls: list[str], raw_hosts: str) -> list[str]:
 
 
 def test_group_candidates(client, config: MonitorConfig, candidates, on_result=None):
-    """测试策略组全部候选，并在结束后恢复测试前的节点。"""
+    """并行测试策略组全部候选，测试期间不切换节点。"""
     group = client.selector_groups().get(config.group)
     if not group:
         raise ValueError(f"找不到策略组：{config.group}")
-    original = str(group.get("now") or "")
-    results = {}
-    try:
-        names = [item["name"] if isinstance(item, dict) else str(item) for item in candidates]
+    names = [item["name"] if isinstance(item, dict) else str(item) for item in candidates]
 
-        def delay_probe(name):
-            try:
-                delay, delays = probe_node_delays(client, config, name)
-                return name, {"status": "delay_ok", "delay": delay, "delays": delays}
-            except Exception as exc:
-                return name, {"status": "failed", "error": str(exc)}
+    def report(name, result):
+        result["final"] = True
+        if on_result:
+            on_result(name, result)
 
-        delay_results = {}
-        with ThreadPoolExecutor(max_workers=max(1, min(16, len(names)))) as pool:
-            futures = {pool.submit(delay_probe, name): name for name in names}
-            for future in as_completed(futures):
-                name, result = future.result()
-                delay_results[name] = result
-                if result["status"] == "failed":
-                    result["final"] = True
-                    if on_result:
-                        on_result(name, result)
-                else:
-                    preview = dict(result)
-                    preview["status"] = "ok"
-                    preview["final"] = not config.advanced_web_probe
-                    if on_result:
-                        on_result(name, preview)
-
-        for name in names:
-            result = delay_results[name]
-            passed_delay = result["status"] == "delay_ok"
-            if passed_delay:
-                try:
-                    if config.advanced_web_probe:
-                        client.select(config.group, name)
-                        result["pages"] = probe_selected_web(client, config)
-                    result["status"] = "ok"
-                except Exception as exc:
-                    result = {"status": "failed", "error": str(exc)}
-            result["final"] = True
-            results[name] = result
-            if on_result and config.advanced_web_probe and passed_delay:
-                on_result(name, result)
-    finally:
-        if config.advanced_web_probe and original:
-            client.select(config.group, original)
-    return results
+    return probe_nodes_delays(client, config, names, report)
 
 
 class ConfigApp(ctk.CTk):
@@ -149,7 +107,7 @@ class ConfigApp(ctk.CTk):
         self.interval_entry = ctk.CTkEntry(settings, width=100)
         self.interval_entry.insert(0, str(self.config_data.interval_seconds))
         self.interval_entry.grid(row=1, column=1, padx=(0, 14), pady=10, sticky="w")
-        ctk.CTkLabel(settings, text="失败阈值").grid(row=1, column=2, padx=8, pady=10)
+        ctk.CTkLabel(settings, text="失败阈值（默认 1）").grid(row=1, column=2, padx=8, pady=10)
         self.threshold_entry = ctk.CTkEntry(settings, width=80)
         self.threshold_entry.insert(0, str(self.config_data.failure_threshold))
         self.threshold_entry.grid(row=1, column=3, padx=(0, 14), pady=10)
@@ -157,20 +115,10 @@ class ConfigApp(ctk.CTk):
         self.advanced_probe_var = tk.BooleanVar(value=self.config_data.advanced_web_probe)
         self.advanced_probe_check = ctk.CTkCheckBox(
             settings,
-            text="启用高级网页重定向判定",
+            text="启用严格状态判定（含 AI Studio 地区跳转）",
             variable=self.advanced_probe_var,
-            command=self._toggle_redirect_controls,
         )
-        self.advanced_probe_check.grid(row=2, column=0, columnspan=2, padx=14, pady=(6, 8), sticky="w")
-        ctk.CTkLabel(settings, text="允许最终域名").grid(row=3, column=0, padx=14, pady=8, sticky="w")
-        self.allowed_hosts_entry = ctk.CTkEntry(settings, placeholder_text="多个域名用英文逗号分隔")
-        self.allowed_hosts_entry.insert(0, ", ".join(self.config_data.allowed_redirect_hosts))
-        self.allowed_hosts_entry.grid(row=3, column=1, columnspan=3, padx=(0, 14), pady=8, sticky="ew")
-        ctk.CTkLabel(settings, text="拦截 URL 关键词").grid(row=4, column=0, padx=14, pady=(8, 12), sticky="w")
-        self.blocked_keywords_entry = ctk.CTkEntry(settings, placeholder_text="例如 available-regions")
-        self.blocked_keywords_entry.insert(0, ", ".join(self.config_data.blocked_url_keywords))
-        self.blocked_keywords_entry.grid(row=4, column=1, columnspan=3, padx=(0, 14), pady=(8, 12), sticky="ew")
-        self._toggle_redirect_controls()
+        self.advanced_probe_check.grid(row=2, column=0, columnspan=4, padx=14, pady=(6, 12), sticky="w")
 
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.grid(row=2, column=0, padx=24, pady=14, sticky="nsew")
@@ -222,14 +170,6 @@ class ConfigApp(ctk.CTk):
 
     def _client(self) -> MihomoClient:
         return MihomoClient(ControllerSettings(url=self.config_data.controller_url, socket_path=self.config_data.controller_socket))
-
-    def _toggle_redirect_controls(self) -> None:
-        state = "normal" if self.advanced_probe_var.get() else "disabled"
-        for widget in (
-            self.allowed_hosts_entry,
-            self.blocked_keywords_entry,
-        ):
-            widget.configure(state=state)
 
     def _background(self, func, success=None, failure=None) -> None:
         def worker() -> None:
@@ -379,13 +319,6 @@ class ConfigApp(ctk.CTk):
         config.interval_seconds = interval
         config.failure_threshold = threshold
         config.advanced_web_probe = self.advanced_probe_var.get()
-        hosts = normalize_allowed_hosts(config.test_urls, self.allowed_hosts_entry.get())
-        if config.advanced_web_probe and not hosts:
-            raise ValueError("启用高级判定时，请至少允许一个最终重定向域名")
-        config.allowed_redirect_hosts = hosts
-        config.blocked_url_keywords = [
-            item.strip().lower() for item in self.blocked_keywords_entry.get().split(",") if item.strip()
-        ]
         config.group = self.group_menu.get()
         if selected:
             config.candidates = selected
