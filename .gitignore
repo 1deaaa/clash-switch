@@ -16,6 +16,7 @@ htmlcov/
 
 # Logs
 *.log
+*.log.*
 monitor.log
 
 # User Configuration

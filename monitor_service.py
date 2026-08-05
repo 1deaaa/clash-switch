@@ -69,6 +69,78 @@ def configure_logging() -> None:
     )
 
 
+def cache_node_result(
+    node_cache: dict[str, dict[str, object]],
+    name: str,
+    result: dict[str, object],
+    round_id: int,
+) -> None:
+    """记录节点结果及其新鲜度信息。"""
+    cached = dict(result)
+    cached["checked_at"] = time.monotonic()
+    cached["round_id"] = round_id
+    node_cache[name] = cached
+
+
+def fresh_cached_candidates(
+    config: MonitorConfig,
+    current: str,
+    node_cache: dict[str, dict[str, object]],
+    round_id: int | None = None,
+) -> list[tuple[int, str, dict[str, object]]]:
+    """返回仍在有效期内的成功候选，并优先返回指定轮次的结果。"""
+    now = time.monotonic()
+    current_round: list[tuple[int, str, dict[str, object]]] = []
+    previous_round: list[tuple[int, str, dict[str, object]]] = []
+    for name in config.candidates:
+        cached = node_cache.get(name)
+        if name == current or not cached or cached.get("status") != "ok":
+            continue
+        try:
+            checked_at = float(cached["checked_at"])
+            delay = int(cached["delay"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if now - checked_at > CACHE_MAX_AGE_SECONDS:
+            continue
+        item = (delay, name, cached)
+        if round_id is not None and cached.get("round_id") == round_id:
+            current_round.append(item)
+        else:
+            previous_round.append(item)
+    if round_id is None:
+        return previous_round
+    return current_round or previous_round
+
+
+def switch_to_best_fresh_candidate(
+    client,
+    config: MonitorConfig,
+    current: str,
+    node_cache: dict[str, dict[str, object]],
+    round_id: int | None = None,
+) -> dict[str, object] | None:
+    """使用最新的成功缓存切换到当前可选范围内延迟最低的节点。"""
+    available = fresh_cached_candidates(config, current, node_cache, round_id)
+    if not available:
+        return None
+    delay, best, cached = min(available)
+    client.select(config.group, best)
+    if round_id is None:
+        source = "最近一次"
+    elif cached.get("round_id") == round_id:
+        source = "本轮"
+    else:
+        source = "上一轮"
+    age = time.monotonic() - float(cached["checked_at"])
+    return {
+        "selected": best,
+        "delay": delay,
+        "cache_source": source,
+        "cache_age_seconds": age,
+    }
+
+
 class Monitor:
     def __init__(self, config: MonitorConfig, stop_event: threading.Event | None = None):
         self.config = config
@@ -87,40 +159,32 @@ class Monitor:
         return str(group.get("now") or "")
 
     def _update_cache(self, name: str, result: dict[str, object], round_id: int) -> None:
-        cached = dict(result)
-        cached["checked_at"] = time.monotonic()
-        cached["round_id"] = round_id
-        self.node_cache[name] = cached
+        cache_node_result(self.node_cache, name, result, round_id)
 
     def _fresh_cached_candidates(self, current: str, round_id: int) -> list[tuple[int, str, dict[str, object]]]:
-        now = time.monotonic()
-        current_round = []
-        previous_round = []
-        for name in self.config.candidates:
-            cached = self.node_cache.get(name)
-            if name == current or not cached or cached.get("status") != "ok":
-                continue
-            if now - float(cached["checked_at"]) > CACHE_MAX_AGE_SECONDS:
-                continue
-            item = (int(cached["delay"]), name, cached)
-            if cached.get("round_id") == round_id:
-                current_round.append(item)
-            else:
-                previous_round.append(item)
-        return current_round or previous_round
+        return fresh_cached_candidates(self.config, current, self.node_cache, round_id)
 
     def _switch_from_cache(self, current: str, round_id: int) -> dict[str, object] | None:
-        available = self._fresh_cached_candidates(current, round_id)
-        if not available:
+        switched = switch_to_best_fresh_candidate(
+            self.client,
+            self.config,
+            current,
+            self.node_cache,
+            round_id,
+        )
+        if not switched:
             return None
-        delay, best, cached = min(available)
-        self.client.select(self.config.group, best)
         self.failures = 0
         self.failed_node = ""
-        source = "本轮" if cached.get("round_id") == round_id else "上一轮"
-        age = time.monotonic() - float(cached["checked_at"])
-        logging.info("已使用%s缓存切换：%s -> %s（%d ms，缓存 %.1f 秒）", source, current, best, delay, age)
-        return {"selected": best, "delay": delay, "cache_source": source, "cache_age_seconds": age}
+        logging.info(
+            "已使用%s缓存切换：%s -> %s（%d ms，缓存 %.1f 秒）",
+            switched["cache_source"],
+            current,
+            switched["selected"],
+            switched["delay"],
+            switched["cache_age_seconds"],
+        )
+        return switched
 
     def check_once(self, allow_switch: bool = True) -> dict[str, object]:
         current = self._current()
