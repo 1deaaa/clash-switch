@@ -41,6 +41,7 @@ class MonitorConfig:
     candidates: list[str] = field(default_factory=list)
     controller_url: str = ""
     controller_socket: str = ""
+    controller_pipe: str = ""
 
     @classmethod
     def load(cls) -> "MonitorConfig":
@@ -145,7 +146,11 @@ class Monitor:
     def __init__(self, config: MonitorConfig, stop_event: threading.Event | None = None):
         self.config = config
         self.stop_event = stop_event or threading.Event()
-        settings = ControllerSettings(url=config.controller_url, socket_path=config.controller_socket)
+        settings = ControllerSettings(
+            url=config.controller_url,
+            socket_path=config.controller_socket,
+            pipe_path=config.controller_pipe,
+        )
         self.client = MihomoClient(settings)
         self.failures = 0
         self.failed_node = ""

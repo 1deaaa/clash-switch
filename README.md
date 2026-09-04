@@ -18,7 +18,7 @@
 
 主窗体日志默认只显示当前节点的探测结果，候选节点的整组结果保留在“查看节点”面板中。
 
-程序默认连接 `\\.\pipe\verge-mihomo`，无需开启外部控制端口。若双击无反应，在 PowerShell 中执行：
+程序优先读取 Clash Verge Rev 配置中的 `external-controller-pipe` 并连接本地命名管道，无需开启外部控制端口；管道不可用时才尝试 `controller_url`。若双击无反应，在 PowerShell 中执行：
 
 ```powershell
 cd D:\Desktop\ClashVergeAutoSwitch

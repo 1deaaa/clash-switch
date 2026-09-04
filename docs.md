@@ -14,9 +14,11 @@
 
 本项目的连接优先级：
 
-1. `config.json` 明确配置的 `controller_url`；失败后尝试本地 IPC。
-2. Windows 使用命名管道 `\\.\pipe\verge-mihomo`。
+1. Windows 优先使用 Clash Verge Rev 配置中的 `external-controller-pipe`，默认值为 `\\.\pipe\verge-mihomo`。
+2. `controller_url` 作为外部 HTTP 控制器备用地址。
 3. Linux 使用配置中的 Unix Socket，或自动查找 `/tmp/verge/verge-mihomo.sock`。
+
+Windows 命名管道使用 Win32 API 打开，并限制本进程同时进行的管道事务数量；管道实例暂时繁忙或尚未创建时会短暂等待并重试。这样可以避免多个并行节点探测通过 Python CRT 同时打开同一管道时产生 `Errno 22`。
 
 > 注意：Mihomo REST API 是官方接口；Clash Verge Rev 的内部 IPC 路径是当前版本实现细节，官方讨论明确表示不会将内部 IPC 作为面向用户的稳定接口文档。若未来版本改变 IPC 路径，可开启仅监听 `127.0.0.1` 的外部控制器，并填写 `controller_url`。
 
@@ -159,7 +161,8 @@ GET /providers/proxies/{提供者名称}
   "group": "🚀节点选择",
   "candidates": ["节点甲", "节点乙"],
   "controller_url": "",
-  "controller_socket": ""
+  "controller_socket": "",
+  "controller_pipe": ""
 }
 ```
 
@@ -176,10 +179,11 @@ GET /providers/proxies/{提供者名称}
 | `candidates` | 字符串数组 | 空 | 只允许在这些节点中自动选择 |
 | `controller_url` | 字符串 | 空 | 外部控制地址，例如 `http://127.0.0.1:9097` |
 | `controller_socket` | 字符串 | 空 | Linux 自定义 Unix Socket 路径 |
+| `controller_pipe` | 字符串 | 空 | Windows 自定义命名管道路径；为空时自动读取 `external-controller-pipe` |
 
 `interval_seconds=60` 与 `failure_threshold=1` 表示每轮开始时并行检测全部节点，当前节点首次失败就触发缓存切换。检测耗时包含在 60 秒周期内；若一轮耗时超过 60 秒，则跳过已经错过的时间点，避免连续启动多轮。
 
-多个测试网址使用“全部通过”语义，显示延迟取其中最大值。全部“节点 × 网址”任务会各提交一次到同一线程池，单轮不重试；一个节点要等自身最慢的网址成功、失败或超时后才形成最终节点结果。单轮耗时主要由最慢请求决定，而不是节点数量乘以超时。
+多个测试网址使用“全部通过”语义，显示延迟取其中最大值。全部“节点 × 网址”任务会各提交一次到同一线程池；Windows 命名管道在客户端内部限制并发并对打开操作短暂重试。一个节点要等自身最慢的网址成功、失败或超时后才形成最终节点结果。单轮耗时主要由最慢请求决定，而不是节点数量乘以超时。
 
 ## 5. 自动切换算法
 
