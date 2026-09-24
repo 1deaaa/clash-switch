@@ -578,6 +578,22 @@ class Monitor:
                     current,
                     result["error"],
                 )
+                if (
+                    allow_switch
+                    and state["switched"] is None
+                    and self.failures >= self.config.failure_threshold
+                    and fresh_cached_candidates(round_config, current, self.node_cache, round_id)
+                ):
+                    # 有上一轮或本轮已完成的新鲜候选时立即处理；订阅刚变化、
+                    # 尚无缓存时则留到整轮结果收齐，避免过早得出“无候选”。
+                    state["switched"] = self._switch_from_cache(
+                        current,
+                        round_id,
+                        round_config,
+                        state["rejected_candidates"],
+                        restore_proxy=restore_proxy,
+                        deadline=time.monotonic() + 15.0,
+                    )
         results = probe_nodes_delays(self.client, round_config, nodes, handle_result)
         current_result = results[current]
         if current_result["status"] == "ok":
@@ -597,8 +613,8 @@ class Monitor:
             and switched is None
             and self.failures >= self.config.failure_threshold
         ):
-            # 当前节点失败后只在整轮延迟结果收齐时作一次切换决策。这样不会
-            # 在候选仍未写入本轮缓存时过早放弃，也不会阻塞其它探测回调。
+            # 没有可立即使用的新鲜缓存时，等整轮延迟结果收齐再作切换决策。
+            # 这样不会在候选仍未写入本轮缓存时过早放弃。
             switch_deadline = time.monotonic() + max(
                 15.0,
                 min(90.0, max(5, round_config.interval_seconds) * 0.75),
