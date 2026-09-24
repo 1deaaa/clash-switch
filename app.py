@@ -14,14 +14,17 @@ from tkinter import font as tkfont, messagebox
 
 import customtkinter as ctk
 
-from mihomo_client import ControllerSettings, MihomoClient
+from mihomo_client import ControllerSettings, MihomoClient, MihomoError
 from monitor_service import (
     CONFIG_PATH,
     LOG_PATH,
     MonitorConfig,
+    _ai_studio_page_error,
     cache_node_result,
     probe_nodes_delays,
-    switch_to_best_fresh_candidate,
+    resolve_route_group,
+    resolve_runtime_group,
+    switch_to_best_verified_candidate,
 )
 from service_manager import MonitorServiceManager, ServiceManagerError
 
@@ -69,10 +72,18 @@ def filter_current_node_logs(lines: list[str], current: str, limit: int = 40) ->
 
 def test_group_candidates(client, config: MonitorConfig, candidates, on_result=None):
     """并行测试策略组全部候选，测试期间不切换节点。"""
-    group = client.selector_groups().get(config.group)
-    if not group:
-        raise ValueError(f"找不到策略组：{config.group}")
-    names = [item["name"] if isinstance(item, dict) else str(item) for item in candidates]
+    proxies = client.proxies()
+    groups = {name: item for name, item in proxies.items() if item.get("type") == "Selector"}
+    route_group = resolve_route_group(client, config, groups, proxies)
+    runtime_group = route_group or resolve_runtime_group(config, groups, proxies)
+    config.group = runtime_group
+    _, live_candidates = client.selector_group_snapshot(runtime_group, proxies=proxies)
+    live_names = [item["name"] for item in live_candidates]
+    live_name_set = set(live_names)
+    requested_names = [item["name"] if isinstance(item, dict) else str(item) for item in candidates]
+    names = [name for name in requested_names if name in live_name_set] or live_names
+    if not names:
+        raise ValueError(f"策略组没有可测试的真实节点：{runtime_group}")
 
     def report(name, result):
         result["final"] = True
@@ -96,6 +107,13 @@ class ConfigApp(ctk.CTk):
         self.node_status_labels = {}
         self.node_test_results = {}
         self.selected_candidates = set(self.config_data.candidates)
+        self._live_candidate_names: set[str] = set()
+        self._candidate_group = ""
+        self._group_live_candidate_names: dict[str, set[str]] = {}
+        # 勾选状态按节点名称全局保存；同名节点出现在多个策略组时，所有视图共享一个状态。
+        self._group_selected_candidates: dict[str, set[str]] = {}
+        if self.config_data.group:
+            self._group_selected_candidates[self.config_data.group] = set(self.config_data.candidates)
         self.provider_filter = "全部订阅"
         self._selection_anchor: str | None = None
         self._shift_pressed = False
@@ -114,13 +132,14 @@ class ConfigApp(ctk.CTk):
         self._manual_task_running = False
         self._manual_log_entries: list[tuple[str, str]] = []
         self._last_log_text = ""
+        self._status_refresh_job: str | None = None
         self.bind_all("<KeyPress-Shift_L>", self._mark_shift_pressed, add="+")
         self.bind_all("<KeyPress-Shift_R>", self._mark_shift_pressed, add="+")
         self.bind_all("<KeyRelease-Shift_L>", self._mark_shift_released, add="+")
         self.bind_all("<KeyRelease-Shift_R>", self._mark_shift_released, add="+")
         self._build()
         self.after(200, self.refresh_groups)
-        self.after(1000, self.refresh_status)
+        self._schedule_status_refresh(1000)
 
     def _build(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -306,24 +325,66 @@ class ConfigApp(ctk.CTk):
 
     def refresh_groups(self) -> None:
         self.refresh_button.configure(state="disabled")
-        def done(groups: dict) -> None:
-            names = list(groups) or ["没有 Selector 策略组"]
+        def done(snapshot: tuple[dict, dict, str | None]) -> None:
+            groups, proxies, route_group = snapshot
+            names = list(groups)
+            if not names:
+                names = ["没有 Selector 策略组"]
+                selected = names[0]
+            else:
+                try:
+                    configured_group = groups.get(self.config_data.group, {})
+                    configured_names = {
+                        str(item)
+                        for item in configured_group.get("all", [])
+                        if str(item) in proxies and proxies[str(item)].get("type") not in {
+                            "Selector",
+                            "URLTest",
+                            "Fallback",
+                            "LoadBalance",
+                            "Direct",
+                            "Reject",
+                            "Pass",
+                            "Compatible",
+                        }
+                    }
+                    prefer_largest = bool(self.config_data.candidates) and not set(
+                        self.config_data.candidates
+                    ).issubset(configured_names)
+                    selected = route_group
+                    if not selected:
+                        selected = resolve_runtime_group(
+                            self.config_data,
+                            groups,
+                            proxies,
+                            prefer_largest=prefer_largest,
+                        )
+                except MihomoError:
+                    names.insert(0, "请选择有效策略组")
+                    selected = names[0]
             self.group_menu.configure(values=names)
-            selected = self.config_data.group if self.config_data.group in groups else names[0]
             self.group_menu.set(selected)
             current = str(groups.get(selected, {}).get("now") or "")
             self._set_current_node(current)
             self.refresh_button.configure(state="normal")
             self.refresh_candidates()
-        self._background(self._client().selector_groups, done)
+        def load_groups() -> tuple[dict, dict, str | None]:
+            client = self._client()
+            proxies = client.proxies()
+            groups = {name: item for name, item in proxies.items() if item.get("type") == "Selector"}
+            route_group = resolve_route_group(client, self.config_data, groups, proxies)
+            return groups, proxies, route_group
+
+        self._background(load_groups, done)
 
     def refresh_candidates(self) -> None:
+        self._capture_visible_selection()
         group = self.group_menu.get()
         self.node_test_results = {}
         self.node_test_cache = {}
         self._manual_log_entries = []
         self._selection_anchor = None
-        if group == "没有 Selector 策略组":
+        if group in {"没有 Selector 策略组", "请选择有效策略组"}:
             self._set_current_node("", "当前使用节点：没有可用策略组")
             self._all_candidates = []
             self.provider_filter = "全部订阅"
@@ -336,13 +397,33 @@ class ConfigApp(ctk.CTk):
             current, items = snapshot
             if group != self.group_menu.get():
                 return
+            live_names = {item["name"] for item in items}
+            previous_live = self._group_live_candidate_names.get(group)
+            if previous_live is None:
+                # 首次进入分组时沿用其它分组已经勾选的同名节点；完全没有交集才默认全选。
+                if not self.selected_candidates.intersection(live_names):
+                    self.selected_candidates.update(live_names)
+            elif previous_live and not previous_live.intersection(live_names):
+                # 订阅整体替换时，当前组的新节点全部进入候选，同时保留其它分组的选择。
+                self.selected_candidates.update(live_names)
+            self._live_candidate_names = live_names
+            self._group_live_candidate_names[group] = set(live_names)
+            self._sync_group_selection_maps()
+            self._candidate_group = group
             self._set_current_node(current)
             self._all_candidates = items
             providers = ["全部订阅"] + sorted({item["provider"] for item in items})
             self._update_candidate_summary()
             self._configure_provider_menu(providers)
             self._render_candidates()
-        self._background(lambda: self._client().selector_group_candidates(group), done)
+        self._background(lambda: self._client().selector_group_snapshot(group), done)
+
+    def _sync_group_selection_maps(self) -> None:
+        """把全局勾选集合投影到各已读取策略组，供状态保持和调试使用。"""
+        self._group_selected_candidates = {
+            group: self.selected_candidates.intersection(names)
+            for group, names in self._group_live_candidate_names.items()
+        }
 
     def _filter_provider(self, value: str) -> None:
         self._capture_visible_selection()
@@ -355,6 +436,7 @@ class ConfigApp(ctk.CTk):
                 self.selected_candidates.add(name)
             else:
                 self.selected_candidates.discard(name)
+        self._sync_group_selection_maps()
 
     def _mark_shift_pressed(self, _event: tk.Event) -> None:
         self._shift_pressed = True
@@ -543,9 +625,6 @@ class ConfigApp(ctk.CTk):
             self.log_box.insert("end", text)
 
     def test_once(self) -> None:
-        if self._is_running():
-            messagebox.showwarning("服务运行中", "请先停止后台服务，再执行整组测试")
-            return
         if self._manual_task_running:
             return
         try:
@@ -595,9 +674,6 @@ class ConfigApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def test_current_node(self) -> None:
-        if self._is_running():
-            messagebox.showwarning("服务运行中", "请先停止后台服务，再执行手动测试")
-            return
         if self._manual_task_running:
             return
         try:
@@ -614,15 +690,25 @@ class ConfigApp(ctk.CTk):
         def worker():
             try:
                 client = self._client()
-                current = client.current_selector(config.group)
+                groups = client.selector_groups()
+                proxies = client.proxies()
+                route_group = resolve_route_group(client, config, groups, proxies)
+                runtime_group = route_group or resolve_runtime_group(config, groups, proxies)
+                current, _ = client.selector_group_snapshot(runtime_group, proxies=proxies)
                 if not current:
                     raise ValueError("当前策略组没有选中节点")
+                config.group = runtime_group
                 result = probe_nodes_delays(client, config, [current])[current]
+                if result["status"] == "ok":
+                    page_error = _ai_studio_page_error(client, config)
+                    if page_error:
+                        result["status"] = "failed"
+                        result["error"] = page_error
                 result["final"] = True
                 cache_node_result(self.node_test_cache, current, result, round_id)
 
                 def done():
-                    if config.group == self.group_menu.get():
+                    if runtime_group == self.group_menu.get():
                         self._set_current_node(current)
                     self._apply_node_result(current, result)
                     if result["status"] == "ok":
@@ -675,10 +761,15 @@ class ConfigApp(ctk.CTk):
             selected_result = None
             try:
                 client = self._client()
-                current = client.current_selector(config.group)
+                proxies = client.proxies()
+                groups = {name: item for name, item in proxies.items() if item.get("type") == "Selector"}
+                route_group = resolve_route_group(client, config, groups, proxies)
+                runtime_group = route_group or resolve_runtime_group(config, groups, proxies)
+                config.group = runtime_group
+                current, _ = client.selector_group_snapshot(runtime_group, proxies=proxies)
                 if not current:
                     raise ValueError("当前策略组没有选中节点")
-                cached = switch_to_best_fresh_candidate(
+                cached = switch_to_best_verified_candidate(
                     client,
                     config,
                     current,
@@ -698,7 +789,7 @@ class ConfigApp(ctk.CTk):
                     cache_node_result(self.node_test_cache, name, result, round_id)
                     self.after(0, lambda node=name, item=result: self._apply_node_result(node, item))
                     if result.get("status") == "ok" and selected_result is None:
-                        switched = switch_to_best_fresh_candidate(
+                        switched = switch_to_best_verified_candidate(
                             client,
                             config,
                             current,
@@ -762,7 +853,7 @@ class ConfigApp(ctk.CTk):
         except ServiceManagerError as exc:
             messagebox.showerror("启动服务失败", str(exc))
             return
-        self.after(500, self.refresh_status)
+        self._schedule_status_refresh(500)
 
     def stop_service(self) -> None:
         try:
@@ -789,7 +880,12 @@ class ConfigApp(ctk.CTk):
                 self._set_current_node("", "当前使用节点：无法读取")
             self._current_node_refreshing = False
 
-        self._background(lambda: self._client().current_selector(group), done, failed)
+        def read_current() -> str:
+            client = self._client()
+            proxies = client.proxies()
+            return client.selector_group_snapshot(group, proxies=proxies)[0]
+
+        self._background(read_current, done, failed)
 
     def refresh_status(self) -> None:
         running = self._is_running()
@@ -800,7 +896,20 @@ class ConfigApp(ctk.CTk):
         self.status_label.configure(text="服务运行中" if running else "服务未运行")
         self._refresh_current_node()
         self._refresh_log_box()
-        self.after(3000, self.refresh_status)
+        self._schedule_status_refresh()
+
+    def _schedule_status_refresh(self, delay_ms: int = 3000) -> None:
+        """确保状态刷新始终只有一个待执行的定时回调。"""
+        if self._status_refresh_job is not None:
+            try:
+                self.after_cancel(self._status_refresh_job)
+            except tk.TclError:
+                pass
+        self._status_refresh_job = self.after(delay_ms, self._run_status_refresh)
+
+    def _run_status_refresh(self) -> None:
+        self._status_refresh_job = None
+        self.refresh_status()
 
 
 def main() -> None:

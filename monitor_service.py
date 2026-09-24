@@ -10,7 +10,7 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from mihomo_client import ControllerSettings, MihomoClient, MihomoError
 
@@ -20,6 +20,21 @@ CONFIG_PATH = ROOT / "config.json"
 PID_PATH = ROOT / "monitor.pid"
 LOG_PATH = ROOT / "monitor.log"
 CACHE_MAX_AGE_SECONDS = 90.0
+MAX_PROBE_WORKERS = 8
+AI_STUDIO_HOST = "aistudio.google.com"
+NESTED_PROXY_TYPES = frozenset({"Selector", "URLTest", "Fallback", "LoadBalance"})
+NON_NODE_PROXY_TYPES = frozenset(
+    {
+        "Selector",
+        "URLTest",
+        "Fallback",
+        "LoadBalance",
+        "Direct",
+        "Reject",
+        "Pass",
+        "Compatible",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -141,6 +156,189 @@ def switch_to_best_fresh_candidate(
     }
 
 
+def switch_to_best_verified_candidate(
+    client,
+    config: MonitorConfig,
+    current: str,
+    node_cache: dict[str, dict[str, object]],
+    round_id: int | None = None,
+) -> dict[str, object] | None:
+    """按缓存延迟尝试候选，并在真正切换后复核 AI Studio。"""
+    rejected: dict[str, str] = {}
+    selected_any = False
+    switched: dict[str, object] | None = None
+    try:
+        while True:
+            available = [
+                item
+                for item in fresh_cached_candidates(config, current, node_cache, round_id)
+                if item[1] not in rejected
+            ]
+            if not available:
+                return None
+            delay, best, cached = min(available)
+            try:
+                client.select(config.group, best)
+                selected_any = True
+            except MihomoError as exc:
+                rejected[best] = f"切换失败：{exc}"
+                cache_node_result(
+                    node_cache,
+                    best,
+                    {"status": "failed", "error": rejected[best]},
+                    round_id or 0,
+                )
+                continue
+
+            page_error = _ai_studio_page_error(client, config)
+            if page_error:
+                rejected[best] = page_error
+                cache_node_result(
+                    node_cache,
+                    best,
+                    {"status": "failed", "error": page_error},
+                    round_id or 0,
+                )
+                logging.warning("手动切换候选复核失败：%s（%s），继续尝试其它节点", best, page_error)
+                continue
+
+            source = "最近一次" if round_id is None else (
+                "本轮" if cached.get("round_id") == round_id else "上一轮"
+            )
+            age = time.monotonic() - float(cached["checked_at"])
+            switched = {
+                "selected": best,
+                "delay": delay,
+                "cache_source": source,
+                "cache_age_seconds": age,
+            }
+            return switched
+    finally:
+        if selected_any and switched is None:
+            try:
+                client.select(config.group, current)
+            except MihomoError as exc:
+                logging.error("手动候选复核均失败，恢复原节点失败：%s", exc)
+
+
+def _ai_studio_test_url(config: MonitorConfig) -> str | None:
+    if not config.advanced_web_probe:
+        return None
+    for url in config.test_urls:
+        if (urllib.parse.urlparse(url).hostname or "").lower() == AI_STUDIO_HOST:
+            return url
+    return None
+
+
+def _ai_studio_page_error(client, config: MonitorConfig) -> str | None:
+    url = _ai_studio_test_url(config)
+    if not url:
+        return None
+    try:
+        client.web_probe(
+            url,
+            config.timeout_ms,
+            config.allowed_redirect_hosts,
+            config.blocked_url_keywords,
+        )
+    except Exception as exc:
+        return f"AI Studio 网页复核失败：{exc}"
+    return None
+
+
+def resolve_runtime_group(
+    config: MonitorConfig,
+    groups: dict[str, dict[str, object]],
+    proxies: dict[str, dict[str, object]] | None = None,
+    prefer_largest: bool = False,
+) -> str:
+    if config.group in groups and not prefer_largest:
+        return config.group
+
+    def score(name: str) -> int:
+        lowered = name.casefold()
+        for keyword, value in (("aistudio", 4), ("gemini", 3), ("google", 2), ("ai", 1)):
+            if keyword in lowered:
+                return value
+        return 0
+
+    def real_names(name: str) -> set[str]:
+        """递归统计策略组中的真实节点，避免只按直接成员误判大小。"""
+        source = proxies or groups
+        names: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(group_name: str) -> None:
+            if group_name in visited:
+                return
+            visited.add(group_name)
+            for raw_item in source.get(group_name, {}).get("all", []):
+                item_name = str(raw_item)
+                item = source.get(item_name, {})
+                item_type = str(item.get("type") or "")
+                if item_type in NESTED_PROXY_TYPES:
+                    visit(item_name)
+                elif item_type not in NON_NODE_PROXY_TYPES:
+                    names.add(item_name)
+
+        visit(name)
+        return names
+
+    def real_count(name: str) -> int:
+        return len(real_names(name))
+
+    if not groups:
+        raise MihomoError(f"找不到策略组：{config.group}；当前 Selector 策略组：无")
+    ranked = sorted(
+        ((score(name), real_count(name), name) for name in groups),
+        key=lambda item: (item[0], item[1], item[2]),
+        reverse=True,
+    )
+    if prefer_largest or config.group not in groups:
+        candidates = [item for item in ranked if item[1] > 0] or ranked
+        if candidates:
+            return max(candidates, key=lambda item: (item[1], item[0], item[2]))[2]
+    if _ai_studio_test_url(config):
+        named = [item for item in ranked if item[0] > 0]
+        if named:
+            return named[0][2]
+    return ranked[0][2]
+
+
+def resolve_route_group(
+    client,
+    config: MonitorConfig,
+    groups: dict[str, dict[str, object]],
+    proxies: dict[str, dict[str, object]],
+) -> str | None:
+    """优先使用 AI Studio 登录接口实际命中的策略组。"""
+    if not _ai_studio_test_url(config) or not hasattr(client, "selector_group_for_host"):
+        return None
+    # 页面和登录后的 RPC 可能命中不同规则；RPC 决定模型列表能否真正加载。
+    for host in ("alkalimakersuite-pa.clients6.google.com", "aistudio.google.com"):
+        try:
+            group = client.selector_group_for_host(host, proxies=proxies)
+        except Exception as exc:
+            logging.debug("读取 %s 的路由规则失败：%s", host, exc)
+            continue
+        if group in groups:
+            return group
+    return None
+
+
+def _resolve_live_candidates(
+    configured: list[str],
+    live_candidates: list[dict[str, str]],
+) -> tuple[list[str], bool]:
+    available = list(dict.fromkeys(item["name"] for item in live_candidates))
+    available_set = set(available)
+    configured_names = list(dict.fromkeys(configured))
+    selected = [name for name in configured_names if name in available_set]
+    if selected and len(selected) == len(configured_names):
+        return selected, False
+    return available, bool(available)
+
+
 class Monitor:
     def __init__(self, config: MonitorConfig, stop_event: threading.Event | None = None):
         self.config = config
@@ -151,49 +349,195 @@ class Monitor:
         self.failed_node = ""
         self.round_id = 0
         self.node_cache: dict[str, dict[str, object]] = {}
+        self._last_runtime_group = ""
+        self._last_candidate_fallback: tuple[str, tuple[str, ...]] | None = None
+        self._last_live_signature: tuple[str, tuple[tuple[str, str], ...]] | None = None
 
-    def _current(self) -> str:
-        group = self.client.selector_groups().get(self.config.group)
-        if not group:
-            raise MihomoError(f"找不到策略组：{self.config.group}")
-        return str(group.get("now") or "")
+    def _reload_config(self) -> None:
+        try:
+            latest = MonitorConfig.load()
+        except Exception:
+            logging.exception("重新读取监控配置失败，继续使用上一份有效配置")
+            return
+        if latest == self.config:
+            return
+
+        previous = self.config
+        probe_settings_changed = any(
+            getattr(previous, field_name) != getattr(latest, field_name)
+            for field_name in (
+                "group",
+                "candidates",
+                "test_urls",
+                "timeout_ms",
+                "advanced_web_probe",
+                "allowed_redirect_hosts",
+                "blocked_url_keywords",
+            )
+        )
+        controller_changed = any(
+            getattr(previous, field_name) != getattr(latest, field_name)
+            for field_name in ("controller_url", "controller_socket")
+        )
+        self.config = latest
+        if probe_settings_changed:
+            self.node_cache.clear()
+            self.failures = 0
+            self.failed_node = ""
+        if controller_changed:
+            settings = ControllerSettings(url=latest.controller_url, socket_path=latest.controller_socket)
+            self.client = MihomoClient(settings)
+        logging.info("监控配置已重新加载")
 
     def _update_cache(self, name: str, result: dict[str, object], round_id: int) -> None:
         cache_node_result(self.node_cache, name, result, round_id)
 
-    def _fresh_cached_candidates(self, current: str, round_id: int) -> list[tuple[int, str, dict[str, object]]]:
-        return fresh_cached_candidates(self.config, current, self.node_cache, round_id)
+    def _switch_from_cache(
+        self,
+        current: str,
+        round_id: int,
+        config: MonitorConfig,
+        rejected_candidates: dict[str, str],
+        restore_proxy: str = "",
+    ) -> dict[str, object] | None:
+        selected_any = False
+        switched: dict[str, object] | None = None
+        try:
+            while True:
+                available = [
+                    item
+                    for item in fresh_cached_candidates(config, current, self.node_cache, round_id)
+                    if item[1] not in rejected_candidates
+                ]
+                if not available:
+                    return None
 
-    def _switch_from_cache(self, current: str, round_id: int) -> dict[str, object] | None:
-        switched = switch_to_best_fresh_candidate(
-            self.client,
-            self.config,
-            current,
-            self.node_cache,
-            round_id,
-        )
-        if not switched:
-            return None
-        self.failures = 0
-        self.failed_node = ""
-        logging.info(
-            "已使用%s缓存切换：%s -> %s（%d ms，缓存 %.1f 秒）",
-            switched["cache_source"],
-            current,
-            switched["selected"],
-            switched["delay"],
-            switched["cache_age_seconds"],
-        )
-        return switched
+                delay, best, cached = min(available)
+                try:
+                    self.client.select(config.group, best)
+                    selected_any = True
+                except MihomoError as exc:
+                    error = f"切换候选节点失败：{exc}"
+                    rejected_candidates[best] = error
+                    self._update_cache(best, {"status": "failed", "error": error}, round_id)
+                    logging.warning("候选节点无法切换：%s（%s），继续检查其它候选", best, exc)
+                    continue
+
+                page_error = _ai_studio_page_error(self.client, config)
+                if page_error:
+                    rejected_candidates[best] = page_error
+                    self._update_cache(best, {"status": "failed", "error": page_error}, round_id)
+                    logging.warning("候选节点 AI Studio 网页复核失败：%s（%s），继续检查其它候选", best, page_error)
+                    continue
+
+                if round_id is None:
+                    source = "最近一次"
+                elif cached.get("round_id") == round_id:
+                    source = "本轮"
+                else:
+                    source = "上一轮"
+                age = time.monotonic() - float(cached["checked_at"])
+                self.failures = 0
+                self.failed_node = ""
+                switched = {
+                    "selected": best,
+                    "delay": delay,
+                    "cache_source": source,
+                    "cache_age_seconds": age,
+                }
+                logging.info(
+                    "已使用%s缓存切换：%s -> %s（%d ms，缓存 %.1f 秒）",
+                    source,
+                    current,
+                    best,
+                    delay,
+                    age,
+                )
+                return switched
+        finally:
+            if selected_any and switched is None and restore_proxy and restore_proxy not in rejected_candidates:
+                try:
+                    self.client.select(config.group, restore_proxy)
+                    logging.info("候选网页复核均失败，已恢复原节点：%s", restore_proxy)
+                except MihomoError as exc:
+                    logging.error("候选网页复核均失败，恢复原节点也失败：%s", exc)
 
     def check_once(self, allow_switch: bool = True) -> dict[str, object]:
-        current = self._current()
-        nodes = list(dict.fromkeys([*self.config.candidates, current]))
+        if hasattr(self.client, "proxies"):
+            proxies = self.client.proxies()
+            groups = {name: item for name, item in proxies.items() if item.get("type") == "Selector"}
+        else:
+            groups = self.client.selector_groups()
+            proxies = groups
+        route_group = resolve_route_group(self.client, self.config, groups, proxies)
+        prefer_largest = False
+        if route_group:
+            runtime_group = route_group
+        else:
+            if self.config.group in groups and self.config.candidates and hasattr(self.client, "proxies"):
+                _, configured_live = self.client.selector_group_candidates(self.config.group, proxies=proxies)
+                live_names = {item["name"] for item in configured_live}
+                prefer_largest = not set(self.config.candidates).issubset(live_names)
+            runtime_group = resolve_runtime_group(self.config, groups, proxies, prefer_largest=prefer_largest)
+        restore_proxy = str(groups[runtime_group].get("now") or "")
+        if hasattr(self.client, "proxies"):
+            current, live_candidates = self.client.selector_group_snapshot(runtime_group, proxies=proxies)
+        else:
+            current, live_candidates = self.client.selector_group_snapshot(runtime_group)
+        if not current:
+            raise MihomoError(f"策略组没有当前节点：{runtime_group}")
+        live_signature = (
+            runtime_group,
+            tuple(sorted((str(item["name"]), str(item.get("provider") or "")) for item in live_candidates)),
+        )
+        if live_signature != self._last_live_signature:
+            if self._last_live_signature is not None:
+                logging.info("检测到策略组或订阅节点列表变化，清除旧探测缓存")
+            self.node_cache.clear()
+            self.failures = 0
+            self.failed_node = ""
+            self._last_live_signature = live_signature
+        if runtime_group != self.config.group and runtime_group != self._last_runtime_group:
+            logging.warning(
+                "配置策略组 %s 未命中 AI Studio 实际路由，自动使用策略组 %s",
+                self.config.group,
+                runtime_group,
+            )
+        self._last_runtime_group = runtime_group
+
+        candidates, used_fallback = _resolve_live_candidates(self.config.candidates, live_candidates)
+        if used_fallback:
+            signature = (runtime_group, tuple(candidates))
+            if signature != self._last_candidate_fallback:
+                logging.warning(
+                    "保存的候选节点与当前订阅不匹配，改用策略组 %s 的全部 %d 个真实节点",
+                    runtime_group,
+                    len(candidates),
+                )
+            self._last_candidate_fallback = signature
+        else:
+            self._last_candidate_fallback = None
+
+        round_config = replace(self.config, group=runtime_group, candidates=candidates)
+        nodes = list(dict.fromkeys([current, *candidates]))
         self.round_id += 1
         round_id = self.round_id
-        state: dict[str, object] = {"current_failed": False, "switched": None}
+        state: dict[str, object] = {
+            "current_failed": False,
+            "switched": None,
+            "rejected_candidates": {},
+        }
 
         def handle_result(name: str, result: dict[str, object]) -> None:
+            rejected = state["rejected_candidates"]
+            if name in rejected:
+                result["status"] = "failed"
+                result["error"] = rejected[name]
+            elif name == current and result["status"] == "ok":
+                page_error = _ai_studio_page_error(self.client, round_config)
+                if page_error:
+                    result["status"] = "failed"
+                    result["error"] = page_error
             self._update_cache(name, result, round_id)
             _log_node_result(name, result)
             if name == current:
@@ -219,9 +563,15 @@ class Monitor:
                 and state["switched"] is None
                 and self.failures >= self.config.failure_threshold
             ):
-                state["switched"] = self._switch_from_cache(current, round_id)
+                state["switched"] = self._switch_from_cache(
+                    current,
+                    round_id,
+                    round_config,
+                    rejected,
+                    restore_proxy=restore_proxy,
+                )
 
-        results = probe_nodes_delays(self.client, self.config, nodes, handle_result)
+        results = probe_nodes_delays(self.client, round_config, nodes, handle_result)
         current_result = results[current]
         if current_result["status"] == "ok":
             logging.info("本轮完成：当前节点 %s 可用，保持不变", current)
@@ -255,6 +605,7 @@ class Monitor:
             while not self.stop_event.is_set():
                 started = time.monotonic()
                 try:
+                    self._reload_config()
                     self.check_once()
                 except Exception:
                     logging.exception("本轮监控发生错误")
@@ -283,6 +634,11 @@ def _seconds_until_next_round(elapsed: float, interval_seconds: int) -> float:
     return max(0.0, periods * interval - elapsed)
 
 
+def _probe_worker_count(task_count: int) -> int:
+    """限制探测线程数量，避免大量线程栈长期占用虚拟地址空间。"""
+    return max(1, min(MAX_PROBE_WORKERS, task_count))
+
+
 def probe_nodes_delays(client, config: MonitorConfig, nodes, on_result=None) -> dict[str, dict[str, object]]:
     """在同一线程池中并行测试全部节点与全部目标网址。"""
     names = list(dict.fromkeys(str(node) for node in nodes))
@@ -299,7 +655,7 @@ def probe_nodes_delays(client, config: MonitorConfig, nodes, on_result=None) -> 
         return name, original_url, delay
 
     remaining = {name: len(config.test_urls) for name in names}
-    with ThreadPoolExecutor(max_workers=max(1, min(256, len(tasks)))) as pool:
+    with ThreadPoolExecutor(max_workers=_probe_worker_count(len(tasks))) as pool:
         futures = {pool.submit(probe, task): task for task in tasks}
         for future in as_completed(futures):
             task = futures[future]

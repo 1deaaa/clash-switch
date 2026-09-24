@@ -18,6 +18,7 @@ htmlcov/
 *.log
 *.log.*
 monitor.log
+monitor.pid
 
 # User Configuration
 config.json
