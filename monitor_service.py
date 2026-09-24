@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import logging.handlers
-import math
 import pathlib
 import signal
 import threading
@@ -35,6 +34,15 @@ NON_NODE_PROXY_TYPES = frozenset(
         "Compatible",
     }
 )
+
+
+def _select_node(client, group: str, node: str) -> None:
+    """切换到真实叶节点；嵌套 Selector 时由控制器选择正确的下级组。"""
+    selector = getattr(client, "select_node", None)
+    if selector is not None:
+        selector(group, node)
+    else:
+        client.select(group, node)
 
 
 @dataclass(slots=True)
@@ -140,7 +148,7 @@ def switch_to_best_fresh_candidate(
     if not available:
         return None
     delay, best, cached = min(available)
-    client.select(config.group, best)
+    _select_node(client, config.group, best)
     if round_id is None:
         source = "最近一次"
     elif cached.get("round_id") == round_id:
@@ -178,7 +186,7 @@ def switch_to_best_verified_candidate(
                 return None
             delay, best, cached = min(available)
             try:
-                client.select(config.group, best)
+                _select_node(client, config.group, best)
                 selected_any = True
             except MihomoError as exc:
                 rejected[best] = f"切换失败：{exc}"
@@ -216,7 +224,7 @@ def switch_to_best_verified_candidate(
     finally:
         if selected_any and switched is None:
             try:
-                client.select(config.group, current)
+                _select_node(client, config.group, current)
             except MihomoError as exc:
                 logging.error("手动候选复核均失败，恢复原节点失败：%s", exc)
 
@@ -395,15 +403,19 @@ class Monitor:
     def _switch_from_cache(
         self,
         current: str,
-        round_id: int,
+        round_id: int | None,
         config: MonitorConfig,
         rejected_candidates: dict[str, str],
         restore_proxy: str = "",
+        deadline: float | None = None,
     ) -> dict[str, object] | None:
         selected_any = False
         switched: dict[str, object] | None = None
         try:
             while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    logging.warning("候选 AI Studio 复核达到本轮时间预算，留待下一轮继续")
+                    return None
                 available = [
                     item
                     for item in fresh_cached_candidates(config, current, self.node_cache, round_id)
@@ -414,7 +426,7 @@ class Monitor:
 
                 delay, best, cached = min(available)
                 try:
-                    self.client.select(config.group, best)
+                    _select_node(self.client, config.group, best)
                     selected_any = True
                 except MihomoError as exc:
                     error = f"切换候选节点失败：{exc}"
@@ -457,7 +469,7 @@ class Monitor:
         finally:
             if selected_any and switched is None and restore_proxy and restore_proxy not in rejected_candidates:
                 try:
-                    self.client.select(config.group, restore_proxy)
+                    _select_node(self.client, config.group, restore_proxy)
                     logging.info("候选网页复核均失败，已恢复原节点：%s", restore_proxy)
                 except MihomoError as exc:
                     logging.error("候选网页复核均失败，恢复原节点也失败：%s", exc)
@@ -557,20 +569,6 @@ class Monitor:
                     current,
                     result["error"],
                 )
-            if (
-                allow_switch
-                and state["current_failed"]
-                and state["switched"] is None
-                and self.failures >= self.config.failure_threshold
-            ):
-                state["switched"] = self._switch_from_cache(
-                    current,
-                    round_id,
-                    round_config,
-                    rejected,
-                    restore_proxy=restore_proxy,
-                )
-
         results = probe_nodes_delays(self.client, round_config, nodes, handle_result)
         current_result = results[current]
         if current_result["status"] == "ok":
@@ -584,6 +582,27 @@ class Monitor:
             }
 
         switched = state["switched"]
+        if (
+            allow_switch
+            and state["current_failed"]
+            and switched is None
+            and self.failures >= self.config.failure_threshold
+        ):
+            # 当前节点失败后只在整轮延迟结果收齐时作一次切换决策。这样不会
+            # 在候选仍未写入本轮缓存时过早放弃，也不会阻塞其它探测回调。
+            switch_deadline = time.monotonic() + max(
+                15.0,
+                min(90.0, max(5, round_config.interval_seconds) * 0.75),
+            )
+            switched = self._switch_from_cache(
+                current,
+                round_id,
+                round_config,
+                state["rejected_candidates"],
+                restore_proxy=restore_proxy,
+                deadline=switch_deadline,
+            )
+            state["switched"] = switched
         if switched:
             logging.info("本轮完成：当前节点 %s 失败，已切换到 %s", current, switched["selected"])
             return {
@@ -628,10 +647,9 @@ def _delay_probe_target(url: str, strict: bool) -> tuple[str, str]:
 
 
 def _seconds_until_next_round(elapsed: float, interval_seconds: int) -> float:
-    """按轮次起点保持固定节拍，并跳过已经错过的时间点。"""
+    """按轮次起点保持目标间隔；轮次超时后立即开始下一轮。"""
     interval = max(5, interval_seconds)
-    periods = max(1, math.ceil(elapsed / interval))
-    return max(0.0, periods * interval - elapsed)
+    return max(0.0, interval - elapsed)
 
 
 def _probe_worker_count(task_count: int) -> int:

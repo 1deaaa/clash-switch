@@ -359,6 +359,33 @@ class MihomoClient:
         path = f"/proxies/{urllib.parse.quote(group, safe='')}"
         self.request("PUT", path, {"name": proxy})
 
+    def select_node(
+        self,
+        group: str,
+        proxy: str,
+        proxies: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """切换真实叶节点，必要时沿嵌套 Selector 找到可写的下级组。"""
+        proxies = proxies if proxies is not None else self.proxies()
+        visited: set[str] = set()
+
+        def select_from(selector: str) -> bool:
+            if selector in visited:
+                return False
+            visited.add(selector)
+            data = proxies.get(selector, {})
+            members = [str(item) for item in data.get("all", [])]
+            if proxy in members:
+                self.select(selector, proxy)
+                return True
+            for member in members:
+                if proxies.get(member, {}).get("type") == "Selector" and select_from(member):
+                    return True
+            return False
+
+        if not select_from(group):
+            raise MihomoError(f"策略组 {group} 中不存在节点：{proxy}")
+
     def selector_group_for_host(
         self,
         host: str,
@@ -429,6 +456,18 @@ class MihomoClient:
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
             },
         )
+        # 带上自动发现的 Playwright 登录态。没有 Cookie 时，AI Studio 常会
+        # 返回一个公开的 200 页面，无法反映真实浏览器最终跳转的地区限制页。
+        if target_host.endswith(".google.com") or target_host == "google.com":
+            storage_state = find_storage_state()
+            if storage_state is not None:
+                credentials = self._storage_cookie_header(
+                    storage_state,
+                    target_host,
+                    require_sapisid=False,
+                )
+                if credentials is not None:
+                    request.add_header("Cookie", credentials[0])
         started = time.monotonic()
         try:
             with opener.open(request, timeout=max(1.0, timeout_ms / 1000)) as response:
@@ -486,7 +525,11 @@ class MihomoClient:
         return result
 
     @staticmethod
-    def _storage_cookie_header(storage_state: pathlib.Path, host: str) -> tuple[str, str] | None:
+    def _storage_cookie_header(
+        storage_state: pathlib.Path,
+        host: str,
+        require_sapisid: bool = True,
+    ) -> tuple[str, str] | None:
         try:
             data = json.loads(storage_state.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -516,7 +559,7 @@ class MihomoClient:
         values = {name: value for name, (_, value) in cookies.items()}
         sapisid = values.get("SAPISID") or values.get("__Secure-3PAPISID") or values.get("APISID")
         cookie_header = "; ".join(f"{name}={value}" for name, value in values.items())
-        if not sapisid or not cookie_header:
+        if not cookie_header or (require_sapisid and not sapisid):
             return None
         return cookie_header, sapisid
 
@@ -531,7 +574,7 @@ class MihomoClient:
         if storage_state is None:
             return None
         credentials = self._storage_cookie_header(storage_state, "alkalimakersuite-pa.clients6.google.com")
-        if credentials is None:
+        if credentials is None or not credentials[1]:
             return None
         cookie_header, sapisid = credentials
         api_keys = list(self._aistudio_api_keys)
@@ -584,12 +627,11 @@ class MihomoClient:
                 continue
 
             lowered = api_body.lower()
-            region_error = (
-                any(marker in lowered for marker in ("available regions", "permission denied"))
-                or (
-                    any(marker in lowered for marker in ("region", "location", "account"))
-                    and any(marker in lowered for marker in ("not supported", "unsupported"))
-                )
+            # “Permission denied” 也可能是账号或 API key 的全局问题，不能仅凭
+            # 这一句把所有节点都判死；网页复核会继续确认真实地区跳转。
+            region_error = any(marker in lowered for marker in ("available regions",)) or (
+                any(marker in lowered for marker in ("region", "location", "account"))
+                and any(marker in lowered for marker in ("not supported", "unsupported"))
             )
             if region_error:
                 self._aistudio_api_keys = (api_key,)

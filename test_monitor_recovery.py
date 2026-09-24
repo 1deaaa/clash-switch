@@ -47,6 +47,14 @@ class FakeClient:
         return {"status": 200, "final_url": url}
 
 
+class FailureFirstClient(FakeClient):
+    def test_delay(self, proxy, url, timeout_ms, expected=""):
+        if proxy == "当前节点":
+            raise MihomoError("当前节点不可达")
+        time.sleep(0.03)
+        return {"候选甲": 20, "候选乙": 30}[proxy]
+
+
 class FakeRPCResponse:
     def __init__(self, status: int, body: str):
         self.status = status
@@ -149,6 +157,24 @@ class MonitorRecoveryTests(unittest.TestCase):
         self.assertIn(("🤖AI网站", result["selected"]), client.selections)
         self.assertEqual(client.web_probes[0], "当前节点")
         self.assertIn(result["selected"], client.web_probes)
+
+    def test_switch_waits_for_slow_candidates_after_current_fails(self):
+        config = MonitorConfig(
+            test_urls=["https://aistudio.google.com"],
+            timeout_ms=1000,
+            failure_threshold=1,
+            advanced_web_probe=True,
+            group="🤖AI网站",
+            candidates=["候选甲", "候选乙"],
+        )
+        client = FailureFirstClient()
+        with patch("monitor_service.MihomoClient", return_value=client):
+            monitor = Monitor(config)
+
+        result = monitor.check_once()
+
+        self.assertEqual(result["status"], "switched")
+        self.assertEqual(result["selected"], "候选甲")
 
     def test_failed_candidate_page_is_skipped_for_next_cached_candidate(self):
         config = MonitorConfig(

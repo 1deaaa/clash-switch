@@ -23,7 +23,7 @@ function isBlockedUrl(url) {
 }
 
 function isBlockedText(text) {
-    return /region not supported|account not supported|available regions for google ai studio|failed to list models:\s*permission denied|permission denied/i.test(text);
+    return /region not supported|account not supported|available regions for google ai studio|unsupported region/i.test(text);
 }
 
 function isGoogleApiUrl(url) {
