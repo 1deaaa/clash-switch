@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ctypes
 import hashlib
 import http.client
 import logging
@@ -20,6 +21,13 @@ from typing import Any
 import yaml
 
 from browser_probe import BrowserProbe, BrowserProbeError, BrowserProbeUnavailable, find_storage_state
+
+
+DEFAULT_WINDOWS_PIPE_PATH = r"\\.\pipe\verge-mihomo"
+WINDOWS_PIPE_MAX_CONCURRENCY = 16
+WINDOWS_PIPE_OPEN_RETRIES = 3
+WINDOWS_PIPE_RETRY_DELAY_SECONDS = 0.1
+_WINDOWS_PIPE_SEMAPHORE = threading.BoundedSemaphore(WINDOWS_PIPE_MAX_CONCURRENCY)
 
 
 class MihomoError(RuntimeError):
@@ -78,6 +86,7 @@ class ControllerSettings:
     url: str = ""
     secret: str = ""
     socket_path: str = ""
+    pipe_path: str = ""
 
 
 def _verge_config_candidates() -> list[pathlib.Path]:
@@ -120,6 +129,7 @@ def discover_settings(overrides: ControllerSettings | None = None) -> Controller
     secret = settings.secret
     url = settings.url
     socket_path = settings.socket_path
+    pipe_path = settings.pipe_path
     for path in _verge_config_candidates():
         if not path.exists():
             continue
@@ -130,6 +140,7 @@ def discover_settings(overrides: ControllerSettings | None = None) -> Controller
         secret = secret or str(data.get("secret") or "")
         url = url or str(data.get("external-controller") or "")
         socket_path = socket_path or str(data.get("external-controller-unix") or "")
+        pipe_path = pipe_path or str(data.get("external-controller-pipe") or "")
         break
     if os.name != "nt":
         configured_socket = pathlib.Path(socket_path).expanduser() if socket_path else None
@@ -140,7 +151,9 @@ def discover_settings(overrides: ControllerSettings | None = None) -> Controller
             )
     if url and "://" not in url:
         url = f"http://{url}"
-    return ControllerSettings(url=url, secret=secret, socket_path=socket_path)
+    if os.name == "nt" and not pipe_path:
+        pipe_path = DEFAULT_WINDOWS_PIPE_PATH
+    return ControllerSettings(url=url, secret=secret, socket_path=socket_path, pipe_path=pipe_path)
 
 
 def _decode_http(raw: bytes) -> tuple[int, bytes]:
@@ -174,6 +187,91 @@ class MihomoClient:
         self._browser_probe: BrowserProbe | bool | None = None
         self._aistudio_api_keys: tuple[str, ...] = ()
 
+    @staticmethod
+    def _windows_pipe_error(error_code: int, path: str) -> OSError:
+        message = ctypes.FormatError(error_code).strip() or "Windows 命名管道操作失败"
+        return OSError(error_code, message, path)
+
+    @classmethod
+    def _open_windows_pipe(cls, path: str, timeout: float):
+        """使用 Win32 API 打开命名管道，避免并行探测触发 CRT 错误。"""
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitNamedPipeW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        kernel32.WaitNamedPipeW.restype = ctypes.c_int
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        generic_read = 0x80000000
+        generic_write = 0x40000000
+        open_existing = 3
+        invalid_handle = ctypes.c_void_p(-1).value
+        retryable_errors = {2, 121, 231, 232}
+        deadline = time.monotonic() + max(0.1, timeout)
+        last_error = 2
+        for attempt in range(WINDOWS_PIPE_OPEN_RETRIES):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_ms = max(1, min(1000, round(remaining * 1000)))
+            if not kernel32.WaitNamedPipeW(path, wait_ms):
+                last_error = ctypes.get_last_error()
+            else:
+                handle = kernel32.CreateFileW(
+                    path,
+                    generic_read | generic_write,
+                    0,
+                    None,
+                    open_existing,
+                    0,
+                    None,
+                )
+                if handle != invalid_handle:
+                    try:
+                        descriptor = msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+                    except OSError:
+                        kernel32.CloseHandle(handle)
+                        raise
+                    return os.fdopen(descriptor, "r+b", buffering=0)
+                last_error = ctypes.get_last_error()
+            if last_error not in retryable_errors:
+                break
+            if attempt + 1 < WINDOWS_PIPE_OPEN_RETRIES:
+                time.sleep(min(
+                    WINDOWS_PIPE_RETRY_DELAY_SECONDS * (attempt + 1),
+                    max(0.0, deadline - time.monotonic()),
+                ))
+        raise cls._windows_pipe_error(last_error, path)
+
+    def _windows_pipe_request(self, raw_request: bytes) -> tuple[int, bytes]:
+        """限制本进程管道并发，并在管道暂时繁忙时重试打开。"""
+        if not self.settings.pipe_path:
+            raise MihomoTransportError("未配置 Clash Verge Rev 命名管道")
+        acquired = _WINDOWS_PIPE_SEMAPHORE.acquire(timeout=max(0.1, self.timeout))
+        if not acquired:
+            raise MihomoTransportError("等待 Clash Verge Rev 命名管道并发槽位超时")
+        try:
+            try:
+                with self._open_windows_pipe(self.settings.pipe_path, self.timeout) as pipe:
+                    pipe.write(raw_request)
+                    pipe.flush()
+                    return _decode_http(pipe.read())
+            except OSError as exc:
+                raise MihomoTransportError(f"无法连接 Clash Verge Rev 命名管道：{exc}") from exc
+        finally:
+            _WINDOWS_PIPE_SEMAPHORE.release()
+
     def _raw_request(self, method: str, path: str, payload: bytes | None) -> tuple[int, bytes]:
         headers = ["Host: localhost", "Connection: close", "Accept: application/json"]
         if self.settings.secret:
@@ -183,12 +281,7 @@ class MihomoClient:
         request = f"{method} {path} HTTP/1.1\r\n" + "\r\n".join(headers) + "\r\n\r\n"
         raw_request = request.encode("utf-8") + (payload or b"")
         if os.name == "nt":
-            try:
-                with open(r"\\.\pipe\verge-mihomo", "r+b", buffering=0) as pipe:
-                    pipe.write(raw_request)
-                    return _decode_http(pipe.read())
-            except OSError as exc:
-                raise MihomoTransportError(f"无法连接 Clash Verge Rev 命名管道：{exc}") from exc
+            return self._windows_pipe_request(raw_request)
         if self.settings.socket_path:
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:

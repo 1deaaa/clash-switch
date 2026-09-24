@@ -284,7 +284,13 @@ class ConfigApp(ctk.CTk):
         self._render_candidates()
 
     def _client(self) -> MihomoClient:
-        return MihomoClient(ControllerSettings(url=self.config_data.controller_url, socket_path=self.config_data.controller_socket))
+        return MihomoClient(
+            ControllerSettings(
+                url=self.config_data.controller_url,
+                socket_path=self.config_data.controller_socket,
+                pipe_path=self.config_data.controller_pipe,
+            )
+        )
 
     def _background(self, func, success=None, failure=None) -> None:
         def worker() -> None:

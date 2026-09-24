@@ -64,6 +64,7 @@ class MonitorConfig:
     candidates: list[str] = field(default_factory=list)
     controller_url: str = ""
     controller_socket: str = ""
+    controller_pipe: str = ""
 
     @classmethod
     def load(cls) -> "MonitorConfig":
@@ -351,7 +352,11 @@ class Monitor:
     def __init__(self, config: MonitorConfig, stop_event: threading.Event | None = None):
         self.config = config
         self.stop_event = stop_event or threading.Event()
-        settings = ControllerSettings(url=config.controller_url, socket_path=config.controller_socket)
+        settings = ControllerSettings(
+            url=config.controller_url,
+            socket_path=config.controller_socket,
+            pipe_path=config.controller_pipe,
+        )
         self.client = MihomoClient(settings)
         self.failures = 0
         self.failed_node = ""
@@ -385,7 +390,7 @@ class Monitor:
         )
         controller_changed = any(
             getattr(previous, field_name) != getattr(latest, field_name)
-            for field_name in ("controller_url", "controller_socket")
+            for field_name in ("controller_url", "controller_socket", "controller_pipe")
         )
         self.config = latest
         if probe_settings_changed:
@@ -393,7 +398,11 @@ class Monitor:
             self.failures = 0
             self.failed_node = ""
         if controller_changed:
-            settings = ControllerSettings(url=latest.controller_url, socket_path=latest.controller_socket)
+            settings = ControllerSettings(
+                url=latest.controller_url,
+                socket_path=latest.controller_socket,
+                pipe_path=latest.controller_pipe,
+            )
             self.client = MihomoClient(settings)
         logging.info("监控配置已重新加载")
 

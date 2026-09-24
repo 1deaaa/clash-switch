@@ -161,7 +161,8 @@ GET /providers/proxies/{提供者名称}
   "group": "🚀节点选择",
   "candidates": ["节点甲", "节点乙"],
   "controller_url": "",
-  "controller_socket": ""
+  "controller_socket": "",
+  "controller_pipe": ""
 }
 ```
 
@@ -178,8 +179,9 @@ GET /providers/proxies/{提供者名称}
 | `candidates` | 字符串数组 | 空 | 优先在这些节点中自动选择；订阅更新后若有已保存节点缺失，则自动使用当前 Selector 的全部真实节点 |
 | `controller_url` | 字符串 | 空 | 外部控制地址，例如 `http://127.0.0.1:9097` |
 | `controller_socket` | 字符串 | 空 | Linux 自定义 Unix Socket 路径 |
+| `controller_pipe` | 字符串 | 空 | Windows 自定义命名管道路径；为空时自动读取 `external-controller-pipe` |
 
-`interval_seconds=60` 与 `failure_threshold=1` 表示每轮开始时并行检测全部节点，当前节点首次失败就触发缓存切换。检测耗时包含在 60 秒周期内；若一轮耗时超过 60 秒，则跳过已经错过的时间点，避免连续启动多轮。
+`interval_seconds=60` 与 `failure_threshold=1` 表示每轮开始时并行检测全部节点，当前节点首次失败会在本轮结果收齐后触发缓存切换。检测耗时包含在 60 秒周期内；若一轮耗时超过 60 秒，则下一轮立即开始，避免检测节拍继续漂移。
 
 多个测试网址使用“全部通过”语义，显示延迟取其中最大值。全部“节点 × 网址”任务会各提交一次到同一线程池，单轮不重试；一个节点要等自身最慢的网址成功、失败或超时后才形成最终节点结果。单轮耗时主要由最慢请求决定，而不是节点数量乘以超时。
 
