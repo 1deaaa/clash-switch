@@ -225,6 +225,7 @@ class BrowserProbe:
         self._probe_dir: pathlib.Path | None = None
         self._lock = threading.Lock()
         self._runner: subprocess.Popen[str] | None = None
+        self._runner_storage_signature: tuple[str, int, int] | None = None
         atexit.register(self.close)
 
     def _ensure_probe_profile(self) -> pathlib.Path:
@@ -283,6 +284,13 @@ class BrowserProbe:
             "available regions for google ai studio and gemini api",
             "region not supported",
             "account not supported",
+            "unsupported region",
+            "unsupported country",
+            "not available in your country",
+            "not available in your region",
+            "your location is not supported",
+            "此地区不支持",
+            "所在地区不支持",
         )
         return any(marker in lowered for marker in markers)
 
@@ -293,7 +301,27 @@ class BrowserProbe:
 
     def _start_runner(self) -> subprocess.Popen[str]:
         latest_profile = _browser_runner_profile()
-        if latest_profile is not None and latest_profile != self.runner_profile:
+        latest_signature = None
+        if latest_profile is not None:
+            try:
+                state = latest_profile.storage_state.stat()
+                latest_signature = (
+                    str(latest_profile.storage_state),
+                    state.st_mtime_ns,
+                    state.st_size,
+                )
+            except OSError:
+                latest_signature = None
+        if (
+            latest_profile != self.runner_profile
+            or (
+                latest_signature is not None
+                and latest_signature != self._runner_storage_signature
+            )
+        ):
+            # 登录态文件可能被上游工具原地刷新；Playwright 只在创建
+            # BrowserContext 时读取 storageState，必须重启长期复用的进程
+            # 才能让新 Cookie/API 凭据生效。
             self._stop_runner()
             self.runner_profile = latest_profile
         if self.runner_profile is None:
@@ -326,6 +354,7 @@ class BrowserProbe:
             )
         except OSError as exc:
             raise BrowserProbeUnavailable(f"无法启动 Playwright 浏览器复核：{exc}") from exc
+        self._runner_storage_signature = latest_signature
         return self._runner
 
     def _stop_runner(self) -> None:

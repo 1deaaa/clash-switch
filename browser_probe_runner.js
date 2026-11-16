@@ -19,11 +19,11 @@ function writeResult(result) {
 }
 
 function isBlockedUrl(url) {
-    return /\/docs\/available-regions|available-regions/i.test(url);
+    return /\/docs\/available-regions|available-regions|unsupported[-_ ]?(region|country)|not[-_ ]?supported/i.test(url);
 }
 
 function isBlockedText(text) {
-    return /region not supported|account not supported|available regions for google ai studio|unsupported region/i.test(text);
+    return /region not supported|account not supported|available regions for google ai studio|unsupported region|unsupported country|not available in your (country|region)|your location is not supported|此地区不支持|所在地区不支持/i.test(text);
 }
 
 function isGoogleApiUrl(url) {

@@ -38,6 +38,10 @@ class MihomoTransportError(MihomoError):
     """Mihomo 控制连接暂时不可用，可安全重试请求。"""
 
 
+class MihomoGlobalProbeError(MihomoError):
+    """网页复核所需的本机登录态或浏览器不可用，和节点无关。"""
+
+
 _NESTED_PROXY_TYPES = frozenset({"Selector", "URLTest", "Fallback", "LoadBalance"})
 _NON_NODE_PROXY_TYPES = frozenset(
     {
@@ -107,6 +111,19 @@ def _is_socket(path: pathlib.Path) -> bool:
         return False
 
 
+def _is_connectable_unix_socket(path: pathlib.Path, timeout: float = 0.2) -> bool:
+    """判断 Unix Socket 当前是否有控制器监听。"""
+    if not _is_socket(path):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(max(0.05, timeout))
+            sock.connect(str(path))
+        return True
+    except OSError:
+        return False
+
+
 def _runtime_socket_candidates() -> list[pathlib.Path]:
     """返回 Clash Verge Service 当前可能创建的 Unix Socket 路径。"""
     if os.name == "nt":
@@ -144,11 +161,35 @@ def discover_settings(overrides: ControllerSettings | None = None) -> Controller
         break
     if os.name != "nt":
         configured_socket = pathlib.Path(socket_path).expanduser() if socket_path else None
-        if configured_socket is None or not _is_socket(configured_socket):
-            socket_path = next(
-                (str(candidate) for candidate in _runtime_socket_candidates() if _is_socket(candidate)),
-                "",
-            )
+        runtime_sockets = [
+            candidate
+            for candidate in _runtime_socket_candidates()
+            if _is_socket(candidate)
+        ]
+        # Clash Verge 重载核心后可能保留旧 Socket 文件，同时在 /run 下
+        # 创建新的运行时 Socket。只检查文件类型会把请求持续发到旧地址。
+        socket_candidates = []
+        if configured_socket is not None and _is_socket(configured_socket):
+            socket_candidates.append(configured_socket)
+        socket_candidates.extend(
+            candidate for candidate in runtime_sockets if candidate not in socket_candidates
+        )
+        connected = next(
+            (
+                candidate
+                for candidate in socket_candidates
+                if _is_connectable_unix_socket(candidate)
+            ),
+            None,
+        )
+        if connected is not None:
+            socket_path = str(connected)
+        elif configured_socket is not None and _is_socket(configured_socket):
+            # 控制器可能正处于重启窗口，保留配置地址让 request() 的重试
+            # 机制继续等待并重新发现；下一次发现会切换到可连接地址。
+            socket_path = str(configured_socket)
+        else:
+            socket_path = ""
     if url and "://" not in url:
         url = f"http://{url}"
     if os.name == "nt" and not pipe_path:
@@ -427,8 +468,13 @@ class MihomoClient:
                 name = str(raw_name)
                 item = proxies.get(name, {})
                 item_type = str(item.get("type") or "")
-                if item_type in _NESTED_PROXY_TYPES:
+                # URLTest/Fallback/LoadBalance 由 Mihomo 自动选路，控制器不
+                # 支持对其中的叶节点执行 PUT。只有 Selector 路径上的叶节
+                # 点才是守护进程可以可靠切换并复核的候选。
+                if item_type == "Selector":
                     visit(name)
+                    continue
+                if item_type in _NESTED_PROXY_TYPES:
                     continue
                 if item_type in _NON_NODE_PROXY_TYPES or name in seen_nodes:
                     continue
@@ -589,6 +635,12 @@ class MihomoClient:
             raise MihomoError(f"出口地区不受支持，跳转到：{final_url}")
         if any(marker in lower_body for marker in region_markers):
             raise MihomoError("目标网页包含地区不受支持提示")
+        if target_host == "aistudio.google.com" and (
+            host == "accounts.google.com"
+            or host.endswith(".accounts.google.com")
+            or parsed.path.lower().startswith(("/signin", "/servicelogin"))
+        ):
+            raise MihomoGlobalProbeError("AI Studio 全局复核不可用：浏览器登录态已失效")
         allowed = {item.strip().lower() for item in (allowed_hosts or ["aistudio.google.com", "accounts.google.com"]) if item.strip()}
         if host not in allowed:
             raise MihomoError(f"目标网页跳转到非预期域名：{final_url}")
@@ -600,7 +652,9 @@ class MihomoClient:
             else:
                 browser_probe = self._get_browser_probe()
                 if not browser_probe:
-                    return result
+                    raise MihomoGlobalProbeError(
+                        "AI Studio 全局复核不可用：没有可用浏览器或自动登录态"
+                    )
                 try:
                     # 浏览器只是无法由 RPC 判定时的最后回退；全局串行化，避免多个
                     # MihomoClient 同时拉起完整浏览器导致内存峰值失控。
@@ -611,7 +665,12 @@ class MihomoClient:
                         _SHARED_BROWSER_PROBE = False
                         _BROWSER_PROBE_UNAVAILABLE_AT = time.monotonic()
                     self._browser_probe = False
+                    raise MihomoGlobalProbeError(
+                        "AI Studio 全局复核不可用：没有可用浏览器或自动登录态"
+                    )
                 except BrowserProbeError as exc:
+                    if "登录态已失效" in str(exc):
+                        raise MihomoGlobalProbeError(f"AI Studio 全局复核不可用：{exc}") from exc
                     raise MihomoError(str(exc)) from exc
                 else:
                     result.update(browser_result)
